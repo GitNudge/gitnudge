@@ -55,8 +55,12 @@ ruff check .
 ruff check --fix .
 
 # Type checking
-mypy src/gitnudge
+mypy src/gitnudge --ignore-missing-imports
 ```
+
+### Validation
+
+All request/response models and configuration are validated with **pydantic v2**. When adding new config fields or AI output structures, prefer extending the existing `BaseModel` classes (`Config`, `APIConfig`, `BehaviorConfig`, `UIConfig`, `ConflictResolution`, `RebaseRecommendation`) rather than introducing free-form dicts.
 
 ## How to Contribute
 
@@ -154,19 +158,31 @@ def analyze_conflict(
 ```
 gitnudge/
 ├── src/gitnudge/
-│   ├── __init__.py     # Package initialization
-│   ├── cli.py          # Command-line interface
-│   ├── config.py       # Configuration management
-│   ├── core.py         # Main GitNudge class
-│   ├── git.py          # Git operations wrapper
-│   └── ai.py           # AI integration
+│   ├── __init__.py         # Package initialization
+│   ├── cli.py              # Command-line interface (click)
+│   ├── config.py           # Pydantic configuration models + load/save
+│   ├── core.py             # Main GitNudge class (rebase orchestration, snapshot, recovery)
+│   ├── git.py              # Git operations wrapper (ref validation, progress, skip, etc.)
+│   ├── ai.py               # Claude integration + pydantic AI response models
+│   └── logging_utils.py    # Structured logging with API-key redaction
 ├── tests/
-│   └── test_gitnudge.py
+│   └── test_gitnudge.py    # 100+ unit tests
+├── .github/workflows/
+│   ├── lint.yml            # ruff + mypy on push & PR
+│   ├── test.yml            # pytest on Python 3.9–3.12, ubuntu + macos
+│   └── publish.yml         # Auto-tag on pyproject.toml version bump
 ├── pyproject.toml
 ├── README.md
+├── CHANGELOG.md
 ├── LICENSE
 └── CONTRIBUTING.md
 ```
+
+## Bump and release
+
+1. Update `version` in `pyproject.toml` and `__version__` in `src/gitnudge/__init__.py`.
+2. Add a new section at the top of `CHANGELOG.md` (Added / Changed / Fixed / Security).
+3. Open a PR. Once merged to `main`, the `publish.yml` workflow tags the release automatically.
 
 ## Areas for Contribution
 

@@ -2,36 +2,57 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import anthropic
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+from gitnudge.logging_utils import get_logger, redact_secrets
 
 if TYPE_CHECKING:
     from gitnudge.config import Config
     from gitnudge.git import ConflictFile, RebaseAnalysis
 
+log = get_logger(__name__)
 
-@dataclass
-class ConflictResolution:
+Confidence = Literal["high", "medium", "low"]
+RiskLevel = Literal["low", "medium", "high"]
+
+
+class ConflictResolution(BaseModel):
     """Suggested resolution for a conflict."""
+
+    model_config = ConfigDict(validate_assignment=True)
 
     file_path: str
     resolved_content: str
-    explanation: str
-    confidence: str
-    changes_summary: str
+    explanation: str = ""
+    confidence: Confidence = "medium"
+    changes_summary: str = ""
+
+    @field_validator("confidence", mode="before")
+    @classmethod
+    def _normalize_confidence(cls, v: object) -> str:
+        s = str(v or "").strip().lower()
+        return s if s in ("high", "medium", "low") else "medium"
 
 
-@dataclass
-class RebaseRecommendation:
+class RebaseRecommendation(BaseModel):
     """AI recommendation for a rebase operation."""
 
-    should_proceed: bool
-    risk_level: str
-    explanation: str
-    suggested_approach: str
-    warnings: list[str]
+    model_config = ConfigDict(validate_assignment=True)
+
+    should_proceed: bool = False
+    risk_level: RiskLevel = "medium"
+    explanation: str = ""
+    suggested_approach: str = ""
+    warnings: list[str] = Field(default_factory=list)
+
+    @field_validator("risk_level", mode="before")
+    @classmethod
+    def _normalize_risk(cls, v: object) -> str:
+        s = str(v or "").strip().lower()
+        return s if s in ("low", "medium", "high") else "medium"
 
 
 class AIAssistant:
@@ -59,48 +80,43 @@ class AIAssistant:
     )
 
     def __init__(self, config: Config):
-        """Initialize the AI assistant.
-
-        Args:
-            config: GitNudge configuration.
-        """
+        """Initialize the AI assistant."""
         self.config = config
         self.client = anthropic.Anthropic(api_key=config.api.api_key)
         self.model = config.api.model
         self.max_tokens = config.api.max_tokens
 
+    @staticmethod
+    def _truncate(text: str, max_chars: int) -> str:
+        if max_chars <= 0 or len(text) <= max_chars:
+            return text
+        return text[:max_chars] + "\n... [truncated]"
+
     def analyze_conflict(self, conflict: ConflictFile, context: str = "") -> ConflictResolution:
-        """Analyze a conflict and suggest a resolution.
-
-        Args:
-            conflict: The conflict file to analyze.
-            context: Additional context (commit messages, etc.).
-
-        Returns:
-            ConflictResolution with suggested fix.
-        """
+        """Analyze a conflict and suggest a resolution."""
+        max_chars = max(self.config.behavior.max_context_lines, 10) * 80
         prompt = f"""Analyze this git merge conflict and suggest a resolution.
 
 ## File: {conflict.path.name}
 
 ### Base version (common ancestor):
 ```
-{conflict.base_content[:self.config.behavior.max_context_lines * 80]}
+{self._truncate(conflict.base_content, max_chars)}
 ```
 
 ### Our version (current branch):
 ```
-{conflict.ours_content[:self.config.behavior.max_context_lines * 80]}
+{self._truncate(conflict.ours_content, max_chars)}
 ```
 
 ### Their version (incoming changes):
 ```
-{conflict.theirs_content[:self.config.behavior.max_context_lines * 80]}
+{self._truncate(conflict.theirs_content, max_chars)}
 ```
 
 ### Current file with conflict markers:
 ```
-{conflict.full_content[:self.config.behavior.max_context_lines * 80]}
+{self._truncate(conflict.full_content, max_chars)}
 ```
 
 {f"### Additional context:{chr(10)}{context}" if context else ""}
@@ -130,14 +146,7 @@ CHANGES_SUMMARY:
         return self._parse_conflict_response(str(conflict.path), response)
 
     def analyze_rebase(self, analysis: RebaseAnalysis) -> RebaseRecommendation:
-        """Analyze a potential rebase and provide recommendations.
-
-        Args:
-            analysis: The rebase analysis from git.
-
-        Returns:
-            RebaseRecommendation with advice.
-        """
+        """Analyze a potential rebase and provide recommendations."""
         commits_text = "\n".join([
             f"- {c.short_sha}: {c.message} (files: {', '.join(c.files_changed[:5])})"
             for c in analysis.commits_to_rebase[:20]
@@ -190,26 +199,19 @@ WARNINGS:
         return self._parse_rebase_response(response)
 
     def explain_conflict(self, conflict: ConflictFile) -> str:
-        """Get a plain-language explanation of a conflict.
-
-        Args:
-            conflict: The conflict to explain.
-
-        Returns:
-            Human-readable explanation.
-        """
+        """Get a plain-language explanation of a conflict."""
         prompt = f"""Explain this git merge conflict in plain language for a developer.
 
 ## File: {conflict.path.name}
 
 ### Our version (current branch):
 ```
-{conflict.ours_content[:2000]}
+{self._truncate(conflict.ours_content, 2000)}
 ```
 
 ### Their version (incoming changes):
 ```
-{conflict.theirs_content[:2000]}
+{self._truncate(conflict.theirs_content, 2000)}
 ```
 
 Provide a brief, clear explanation of:
@@ -219,19 +221,12 @@ Provide a brief, clear explanation of:
 
 Keep your explanation concise and actionable."""
 
-        response = self._call_api(prompt)
-        return response
+        return self._call_api(prompt)
 
     def _call_api(self, prompt: str) -> str:
-        """Make an API call to Claude.
-
-        Args:
-            prompt: The prompt to send.
-
-        Returns:
-            Response text.
-        """
+        """Make an API call to Claude."""
         try:
+            log.debug("Calling Claude model=%s max_tokens=%d", self.model, self.max_tokens)
             response = self.client.messages.create(
                 model=self.model,
                 max_tokens=self.max_tokens,
@@ -247,6 +242,7 @@ Keep your explanation concise and actionable."""
             return ""
 
         except anthropic.APIError as e:
+            log.error("Claude API call failed: %s", redact_secrets(e))
             raise AIError(f"API call failed: {e}") from e
 
     def _parse_conflict_response(self, file_path: str, response: str) -> ConflictResolution:
@@ -258,14 +254,11 @@ Keep your explanation concise and actionable."""
         confidence = self._extract_section(response, "CONFIDENCE:").strip().lower()
         summary = self._extract_section(response, "CHANGES_SUMMARY:")
 
-        if confidence not in ("high", "medium", "low"):
-            confidence = "medium"
-
         return ConflictResolution(
             file_path=file_path,
             resolved_content=resolved,
             explanation=explanation,
-            confidence=confidence,
+            confidence=confidence,  # type: ignore[arg-type]
             changes_summary=summary,
         )
 
@@ -275,32 +268,41 @@ Keep your explanation concise and actionable."""
         should_proceed = should_proceed_text in ("yes", "true", "proceed")
 
         risk_level = self._extract_section(response, "RISK_LEVEL:").strip().lower()
-        if risk_level not in ("low", "medium", "high"):
-            risk_level = "medium"
-
         explanation = self._extract_section(response, "EXPLANATION:")
         approach = self._extract_section(response, "SUGGESTED_APPROACH:")
 
         warnings_text = self._extract_section(response, "WARNINGS:")
         if warnings_text.strip().lower() == "none":
-            warnings = []
+            warnings: list[str] = []
         else:
             warnings = [
-                w.strip().lstrip("- ")
+                w.strip().lstrip("- ").strip()
                 for w in warnings_text.strip().split("\n")
                 if w.strip() and w.strip() != "-"
             ]
+            warnings = [w for w in warnings if w]
 
         return RebaseRecommendation(
             should_proceed=should_proceed,
-            risk_level=risk_level,
+            risk_level=risk_level,  # type: ignore[arg-type]
             explanation=explanation,
             suggested_approach=approach,
             warnings=warnings,
         )
 
+    _ALL_HEADERS = (
+        "EXPLANATION:",
+        "RESOLVED_CONTENT:",
+        "CONFIDENCE:",
+        "CHANGES_SUMMARY:",
+        "SHOULD_PROCEED:",
+        "RISK_LEVEL:",
+        "SUGGESTED_APPROACH:",
+        "WARNINGS:",
+    )
+
     def _extract_section(self, text: str, header: str) -> str:
-        """Extract a section from the response text."""
+        """Extract a section from the response text (case-insensitive)."""
         header_lower = header.lower()
         text_lower = text.lower()
 
@@ -308,38 +310,36 @@ Keep your explanation concise and actionable."""
         if start == -1:
             return ""
 
-        start += len(header)
-
-        next_headers = ["EXPLANATION:", "RESOLVED_CONTENT:", "CONFIDENCE:",
-                       "CHANGES_SUMMARY:", "SHOULD_PROCEED:", "RISK_LEVEL:",
-                       "SUGGESTED_APPROACH:", "WARNINGS:"]
+        body_start = start + len(header)
 
         end = len(text)
-        for next_header in next_headers:
-            if next_header.lower() == header_lower:
+        for next_header in self._ALL_HEADERS:
+            nh_lower = next_header.lower()
+            if nh_lower == header_lower:
                 continue
-            pos = text_lower.find(next_header.lower(), start)
+            pos = text_lower.find(nh_lower, body_start)
             if pos != -1 and pos < end:
                 end = pos
 
-        return text[start:end].strip()
+        return text[body_start:end].strip()
 
-    def _extract_code_block(self, text: str) -> str:
+    @staticmethod
+    def _extract_code_block(text: str) -> str:
         """Extract code from a markdown code block."""
         start = text.find("```")
         if start == -1:
             return text.strip()
 
-        start = text.find("\n", start)
-        if start == -1:
+        nl = text.find("\n", start)
+        if nl == -1:
             return text.strip()
-        start += 1
+        body_start = nl + 1
 
-        end = text.find("```", start)
+        end = text.find("```", body_start)
         if end == -1:
-            return text[start:].strip()
+            return text[body_start:].strip()
 
-        return text[start:end].strip()
+        return text[body_start:end].strip()
 
 
 class AIError(Exception):

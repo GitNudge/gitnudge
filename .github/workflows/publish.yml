@@ -1,25 +1,27 @@
 name: Publish
 
 on:
-  workflow_run:
-    workflows: ["Test"]
-    types:
-      - completed
-    branches:
-      - main
+  push:
+    branches: [main]
+    paths:
+      - "pyproject.toml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   publish:
     runs-on: ubuntu-latest
-    if: github.event.workflow_run.conclusion == 'success'
-    permissions:
-      contents: write
 
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.workflow_run.head_branch }}
-          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -31,10 +33,12 @@ jobs:
           version=$(python -c "import tomllib; f=open('pyproject.toml','rb'); data=tomllib.load(f); print(data['project']['version'])")
           tag="v$version"
 
-          if ! git rev-parse "$tag" >/dev/null 2>&1; then
+          if git rev-parse "$tag" >/dev/null 2>&1; then
+            echo "Tag $tag already exists"
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
             git tag "$tag"
             git push origin "$tag"
             echo "Created and pushed tag: $tag"
-          else
-            echo "Tag $tag already exists"
           fi

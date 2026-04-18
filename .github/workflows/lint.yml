@@ -2,7 +2,15 @@ name: Lint
 
 on:
   push:
+    branches: [main]
   pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lint-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   lint:
@@ -16,16 +24,15 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          cache: pip
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install ruff mypy types-click
+          pip install -e ".[dev]"
 
       - name: Run ruff
-        run: |
-          ruff check .
+        run: ruff check .
 
       - name: Run mypy
-        run: |
-          mypy src/gitnudge --ignore-missing-imports
+        run: mypy src/gitnudge --ignore-missing-imports

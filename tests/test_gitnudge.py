@@ -47,24 +47,22 @@ class TestConfig:
         assert len(errors) == 0
 
     def test_config_validation_invalid_verbosity(self):
-        """Test validation catches invalid verbosity."""
+        """Pydantic rejects invalid verbosity at assignment time."""
+        from pydantic import ValidationError
+
         config = Config()
         config.api.api_key = "test-key"
-        config.ui.verbosity = "invalid"
-        errors = config.validate()
-
-        assert len(errors) > 0
-        assert any("verbosity" in e.lower() for e in errors)
+        with pytest.raises(ValidationError):
+            config.ui.verbosity = "invalid"
 
     def test_config_validation_max_context_lines_too_low(self):
-        """Test validation catches max_context_lines < 10."""
+        """Pydantic rejects max_context_lines < 10 at assignment time."""
+        from pydantic import ValidationError
+
         config = Config()
         config.api.api_key = "test-key"
-        config.behavior.max_context_lines = 5
-        errors = config.validate()
-
-        assert len(errors) > 0
-        assert any("max_context_lines" in e for e in errors)
+        with pytest.raises(ValidationError):
+            config.behavior.max_context_lines = 5
 
     def test_config_to_dict(self):
         """Test config serialization to dict."""
@@ -348,7 +346,7 @@ class TestGit:
 
     @patch("subprocess.run")
     def test_get_conflict_details(self, mock_run):
-        """Test getting conflict details."""
+        """Test getting conflict details (file must be inside repo)."""
         mock_run.side_effect = [
             MagicMock(stdout="ours content", returncode=0),
             MagicMock(stdout="theirs content", returncode=0),
@@ -356,26 +354,24 @@ class TestGit:
         ]
 
         with patch.object(Git, "_verify_repo"):
-            with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.py') as f:
-                f.write("""<<<<<<< HEAD
+            with tempfile.TemporaryDirectory() as tmpdir:
+                repo_path = Path(tmpdir).resolve()
+                file_path = repo_path / "conflict.py"
+                file_path.write_text("""<<<<<<< HEAD
 ours code
 =======
 theirs code
 >>>>>>> branch
 """)
-                f.flush()
-                file_path = Path(f.name)
 
                 git = Git()
-                git.repo_path = Path("/test/repo")
+                git.repo_path = repo_path
                 conflict = git.get_conflict_details(file_path)
 
                 assert conflict.ours_content == "ours content"
                 assert conflict.theirs_content == "theirs content"
                 assert conflict.base_content == "base content"
                 assert len(conflict.conflict_markers) == 1
-
-                file_path.unlink()
 
     @patch("subprocess.run")
     def test_get_commits_between(self, mock_run):
@@ -428,11 +424,16 @@ theirs code
         """Test analyzing rebase."""
         mock_run.side_effect = [
             MagicMock(stdout="feature\n", returncode=0),
+            MagicMock(stdout="abc123def\n", returncode=0),
             MagicMock(stdout="base123\n", returncode=0),
+            MagicMock(stdout="head456\n", returncode=0),
+            MagicMock(stdout="target789\n", returncode=0),
             MagicMock(stdout="base123\n", returncode=0),
             MagicMock(stdout="abc123|abc123|Message|Author|2024-01-01\n", returncode=0),
             MagicMock(stdout="file1.py\n", returncode=0),
             MagicMock(stdout="file1.py\nfile2.py\n", returncode=0),
+            MagicMock(stdout="0\t0\tfile1.py\n", returncode=0),
+            MagicMock(stdout="", returncode=0),
         ]
 
         with patch.object(Git, "_verify_repo"):
@@ -841,13 +842,17 @@ class TestGitNudge:
 
         with patch.object(Git, "_verify_repo"):
             nudge = GitNudge(config)
-            with patch.object(nudge.git, "get_rebase_state", return_value=RebaseState.NONE):
-                with patch.object(nudge.git, "analyze_rebase", return_value=analysis):
-                    with patch.object(nudge.git, "start_rebase", return_value=True):
-                        result = nudge.rebase("main")
+            with patch.object(nudge, "preflight", return_value=[]):
+                with patch.object(nudge.git, "get_rebase_state", return_value=RebaseState.NONE):
+                    with patch.object(nudge.git, "analyze_rebase", return_value=analysis):
+                        with patch.object(nudge.git, "get_head_sha", return_value="safe123"):
+                            with patch.object(nudge.git, "start_rebase", return_value=True):
+                                with patch.object(nudge, "_save_snapshot"):
+                                    result = nudge.rebase("main")
 
         assert result.success is True
         assert result.commits_applied == 1
+        assert result.safety_sha == "safe123"
 
     def test_rebase_with_conflicts(self):
         """Test rebase with conflicts."""
@@ -872,20 +877,24 @@ class TestGitNudge:
 
         with patch.object(Git, "_verify_repo"):
             nudge = GitNudge(config)
-            states = [RebaseState.NONE, RebaseState.CONFLICT]
-            with patch.object(nudge.git, "get_rebase_state", side_effect=states):
-                with patch.object(nudge.git, "analyze_rebase", return_value=analysis):
-                    with patch.object(nudge.git, "start_rebase", return_value=False):
-                        conflicted = [Path("test.py")]
-                        get_conflicted = patch.object(
-                            nudge.git, "get_conflicted_files", return_value=conflicted
-                        )
-                        get_details = patch.object(
-                            nudge.git, "get_conflict_details", return_value=conflict_file
-                        )
-                        with get_conflicted:
-                            with get_details:
-                                result = nudge.rebase("main")
+            states = [RebaseState.CONFLICT]
+            with patch.object(nudge, "preflight", return_value=[]):
+                with patch.object(nudge.git, "get_rebase_state", side_effect=states):
+                    with patch.object(nudge.git, "analyze_rebase", return_value=analysis):
+                        with patch.object(nudge.git, "get_head_sha", return_value="safe123"):
+                            with patch.object(nudge.git, "start_rebase", return_value=False):
+                                with patch.object(nudge, "_save_snapshot"):
+                                    conflicted = [Path("test.py")]
+                                    get_conflicted = patch.object(
+                                        nudge.git, "get_conflicted_files",
+                                        return_value=conflicted,
+                                    )
+                                    get_details = patch.object(
+                                        nudge.git, "get_conflict_details",
+                                        return_value=conflict_file,
+                                    )
+                                    with get_conflicted, get_details:
+                                        result = nudge.rebase("main")
 
         assert result.success is False
         assert result.conflicts is not None
@@ -921,27 +930,34 @@ class TestGitNudge:
 
         with patch.object(Git, "_verify_repo"):
             nudge = GitNudge(config)
-            states = [RebaseState.NONE, RebaseState.CONFLICT, RebaseState.NONE]
-            with patch.object(nudge.git, "get_rebase_state", side_effect=states):
-                with patch.object(nudge.git, "analyze_rebase", return_value=analysis):
-                    with patch.object(nudge.git, "start_rebase", return_value=False):
-                        conflicted = [Path("test.py")]
-                        get_conflicted = patch.object(
-                            nudge.git, "get_conflicted_files", return_value=conflicted
-                        )
-                        get_details = patch.object(
-                            nudge.git, "get_conflict_details", return_value=conflict_file
-                        )
-                        resolve = patch.object(nudge, "resolve_conflict", return_value=resolution)
-                        with get_conflicted:
-                            with get_details:
-                                with resolve:
-                                    with patch.object(nudge, "apply_resolution"):
-                                        continue_rebase = patch.object(
-                                            nudge.git, "continue_rebase", return_value=True
-                                        )
-                                        with continue_rebase:
-                                            result = nudge.rebase("main", auto_resolve=True)
+            states = [RebaseState.CONFLICT, RebaseState.NONE]
+            conflicted_calls = [[Path("test.py")], []]
+            with patch.object(nudge, "preflight", return_value=[]):
+                with patch.object(nudge.git, "get_rebase_state", side_effect=states):
+                    with patch.object(nudge.git, "analyze_rebase", return_value=analysis):
+                        with patch.object(nudge.git, "get_head_sha", return_value="safe"):
+                            with patch.object(nudge.git, "start_rebase", return_value=False):
+                                with patch.object(nudge, "_save_snapshot"):
+                                    get_conflicted = patch.object(
+                                        nudge.git, "get_conflicted_files",
+                                        side_effect=conflicted_calls,
+                                    )
+                                    get_details = patch.object(
+                                        nudge.git, "get_conflict_details",
+                                        return_value=conflict_file,
+                                    )
+                                    resolve = patch.object(
+                                        nudge, "resolve_conflict",
+                                        return_value=resolution,
+                                    )
+                                    cont = patch.object(
+                                        nudge.git, "continue_rebase", return_value=True
+                                    )
+                                    with get_conflicted, get_details, resolve, cont:
+                                        with patch.object(nudge, "apply_resolution"):
+                                            result = nudge.rebase(
+                                                "main", auto_resolve=True
+                                            )
 
         assert result.success is True
         assert result.conflicts_resolved == 1
@@ -1455,6 +1471,372 @@ def hello():
                 assistant = AIAssistant(config)
                 with pytest.raises(AIError):
                     assistant._call_api("test prompt")
+
+
+class TestPydanticValidation:
+    """Tests for pydantic-based config validation."""
+
+    def test_max_tokens_too_low(self):
+        from pydantic import ValidationError
+        with pytest.raises(ValidationError):
+            APIConfig(max_tokens=0)
+
+    def test_max_tokens_too_high(self):
+        from pydantic import ValidationError
+        with pytest.raises(ValidationError):
+            APIConfig(max_tokens=10**7)
+
+    def test_empty_model_rejected(self):
+        from pydantic import ValidationError
+        with pytest.raises(ValidationError):
+            APIConfig(model="")
+
+    def test_api_key_stripped(self):
+        cfg = APIConfig(api_key="  sk-ant-abc  ")
+        assert cfg.api_key == "sk-ant-abc"
+
+    def test_max_context_lines_validated(self):
+        from pydantic import ValidationError
+        with pytest.raises(ValidationError):
+            BehaviorConfig(max_context_lines=5)
+        with pytest.raises(ValidationError):
+            BehaviorConfig(max_context_lines=10**6)
+
+    def test_conflict_resolution_normalizes_invalid_confidence(self):
+        r = ConflictResolution(file_path="x", resolved_content="", confidence="bogus")
+        assert r.confidence == "medium"
+
+    def test_rebase_recommendation_normalizes_risk(self):
+        r = RebaseRecommendation(should_proceed=True, risk_level="bogus")
+        assert r.risk_level == "medium"
+
+
+class TestSecurityAndBugFixes:
+    """Tests for security fixes and bug fixes."""
+
+    def test_apply_resolution_rejects_path_traversal(self):
+        config = Config()
+        config.api.api_key = "test-key"
+
+        with patch.object(Git, "_verify_repo"):
+            with tempfile.TemporaryDirectory() as tmpdir:
+                nudge = GitNudge(config, repo_path=Path(tmpdir))
+                resolution = ConflictResolution(
+                    file_path="/etc/passwd",
+                    resolved_content="hacked",
+                )
+                with pytest.raises(GitNudgeError):
+                    nudge.apply_resolution(resolution)
+
+    def test_apply_resolution_relative_path_inside_repo(self):
+        config = Config()
+        config.api.api_key = "test-key"
+        config.behavior.auto_stage = False
+
+        with patch.object(Git, "_verify_repo"):
+            with tempfile.TemporaryDirectory() as tmpdir:
+                nudge = GitNudge(config, repo_path=Path(tmpdir))
+                resolution = ConflictResolution(
+                    file_path="sub/file.py",
+                    resolved_content="ok",
+                )
+                (Path(tmpdir) / "sub").mkdir()
+                nudge.apply_resolution(resolution)
+                assert (Path(tmpdir) / "sub" / "file.py").read_text() == "ok"
+
+    def test_invalid_ref_rejected(self):
+        with patch.object(Git, "_verify_repo"):
+            git = Git()
+            with pytest.raises(GitError):
+                git.get_merge_base("--evil-flag")
+            with pytest.raises(GitError):
+                git.start_rebase("--upstream=evil")
+            with pytest.raises(GitError):
+                git.analyze_rebase("ref with spaces")
+
+    def test_get_conflict_details_uses_full_repo_path(self):
+        with patch.object(Git, "_verify_repo"):
+            with tempfile.TemporaryDirectory() as tmpdir:
+                repo_path = Path(tmpdir).resolve()
+                sub = repo_path / "src" / "deep"
+                sub.mkdir(parents=True)
+                f = sub / "x.py"
+                f.write_text("no markers")
+
+                git = Git()
+                git.repo_path = repo_path
+                with patch.object(Git, "_run") as mock_run:
+                    mock_run.return_value = MagicMock(stdout="", returncode=0)
+                    git.get_conflict_details(f)
+                    show_calls = [
+                        c for c in mock_run.call_args_list
+                        if c.args and c.args[0][0] == "show"
+                    ]
+                    assert show_calls
+                    for c in show_calls:
+                        spec = c.args[0][1]
+                        assert spec.endswith("src/deep/x.py")
+
+
+class TestCLI:
+    """Smoke tests for the CLI."""
+
+    def test_cli_version(self):
+        from click.testing import CliRunner
+
+        from gitnudge.cli import main
+        runner = CliRunner()
+        result = runner.invoke(main, ["--version"])
+        assert result.exit_code == 0
+        assert "0." in result.output
+
+    def test_cli_help(self):
+        from click.testing import CliRunner
+
+        from gitnudge.cli import main
+        runner = CliRunner()
+        result = runner.invoke(main, ["--help"])
+        assert result.exit_code == 0
+        assert "rebase" in result.output
+        assert "config" in result.output
+
+    def test_cli_status_smoke(self):
+        from click.testing import CliRunner
+
+        from gitnudge.cli import main
+        runner = CliRunner()
+        cfg = Config()
+        cfg.api.api_key = "test-key"
+        with patch("gitnudge.cli.Config.load", return_value=cfg):
+            with patch.object(Git, "_verify_repo"):
+                with patch.object(Git, "get_current_branch", return_value="main"):
+                    with patch.object(Git, "get_rebase_state", return_value=RebaseState.NONE):
+                        with patch.object(Git, "get_conflicted_files", return_value=[]):
+                            result = runner.invoke(main, ["status"])
+            assert result.exit_code == 0
+
+
+class TestRebaseFeatures:
+    """Tests for real-rebase improvements: pre-flight, snapshot, markers, skip."""
+
+    def test_preflight_dirty_tree(self):
+        config = Config()
+        config.api.api_key = "test-key"
+
+        with patch.object(Git, "_verify_repo"):
+            nudge = GitNudge(config)
+            with patch.object(nudge.git, "ref_exists", return_value=True):
+                with patch.object(nudge.git, "is_detached_head", return_value=False):
+                    with patch.object(nudge.git, "has_uncommitted_changes", return_value=True):
+                        with patch.object(
+                            nudge.git, "get_rebase_state", return_value=RebaseState.NONE
+                        ):
+                            errors = nudge.preflight("main")
+
+        assert any("uncommitted" in e for e in errors)
+
+    def test_preflight_target_missing(self):
+        config = Config()
+        config.api.api_key = "test-key"
+
+        with patch.object(Git, "_verify_repo"):
+            nudge = GitNudge(config)
+            with patch.object(nudge.git, "ref_exists", return_value=False):
+                errors = nudge.preflight("nope")
+
+        assert any("does not exist" in e for e in errors)
+
+    def test_preflight_detached_head(self):
+        config = Config()
+        config.api.api_key = "test-key"
+
+        with patch.object(Git, "_verify_repo"):
+            nudge = GitNudge(config)
+            with patch.object(nudge.git, "ref_exists", return_value=True):
+                with patch.object(nudge.git, "is_detached_head", return_value=True):
+                    with patch.object(nudge.git, "has_uncommitted_changes", return_value=False):
+                        with patch.object(
+                            nudge.git, "get_rebase_state", return_value=RebaseState.NONE
+                        ):
+                            errors = nudge.preflight("main")
+
+        assert any("detached" in e.lower() for e in errors)
+
+    def test_apply_resolution_rejects_conflict_markers(self):
+        config = Config()
+        config.api.api_key = "test-key"
+
+        with patch.object(Git, "_verify_repo"):
+            with tempfile.TemporaryDirectory() as tmpdir:
+                nudge = GitNudge(config, repo_path=Path(tmpdir))
+                resolution = ConflictResolution(
+                    file_path="x.py",
+                    resolved_content="ok\n<<<<<<< HEAD\nstill bad\n=======\nworse\n>>>>>>> br\n",
+                )
+                with pytest.raises(GitNudgeError):
+                    nudge.apply_resolution(resolution)
+
+    def test_rebase_already_up_to_date(self):
+        config = Config()
+        config.api.api_key = "test-key"
+
+        analysis = RebaseAnalysis(
+            current_branch="feature",
+            target_branch="main",
+            commits_to_rebase=[],
+            potential_conflicts=[],
+            merge_base="base",
+            is_up_to_date=True,
+            has_merge_base=True,
+        )
+
+        with patch.object(Git, "_verify_repo"):
+            nudge = GitNudge(config)
+            with patch.object(nudge, "preflight", return_value=[]):
+                with patch.object(nudge.git, "analyze_rebase", return_value=analysis):
+                    result = nudge.rebase("main")
+
+        assert result.success is True
+        assert "up to date" in result.message.lower()
+
+    def test_rebase_no_merge_base(self):
+        config = Config()
+        config.api.api_key = "test-key"
+
+        analysis = RebaseAnalysis(
+            current_branch="feature",
+            target_branch="main",
+            commits_to_rebase=[],
+            potential_conflicts=[],
+            merge_base="",
+            has_merge_base=False,
+        )
+
+        with patch.object(Git, "_verify_repo"):
+            nudge = GitNudge(config)
+            with patch.object(nudge, "preflight", return_value=[]):
+                with patch.object(nudge.git, "analyze_rebase", return_value=analysis):
+                    with pytest.raises(GitNudgeError):
+                        nudge.rebase("main")
+
+    def test_skip_rebase(self):
+        config = Config()
+        config.api.api_key = "test-key"
+
+        with patch.object(Git, "_verify_repo"):
+            nudge = GitNudge(config)
+            states = [RebaseState.CONFLICT, RebaseState.NONE]
+            with patch.object(nudge.git, "get_rebase_state", side_effect=states):
+                with patch.object(nudge.git, "skip_rebase", return_value=True):
+                    with patch.object(nudge, "_clear_snapshot"):
+                        result = nudge.skip_rebase()
+
+        assert result.success is True
+
+    def test_skip_rebase_no_rebase(self):
+        config = Config()
+        config.api.api_key = "test-key"
+
+        with patch.object(Git, "_verify_repo"):
+            nudge = GitNudge(config)
+            with patch.object(nudge.git, "get_rebase_state", return_value=RebaseState.NONE):
+                with pytest.raises(GitNudgeError):
+                    nudge.skip_rebase()
+
+    def test_snapshot_save_and_clear(self):
+        config = Config()
+        config.api.api_key = "test-key"
+
+        with patch.object(Git, "_verify_repo"):
+            with tempfile.TemporaryDirectory() as tmpdir:
+                git_dir = Path(tmpdir) / ".git"
+                git_dir.mkdir()
+                nudge = GitNudge(config, repo_path=Path(tmpdir))
+                with patch.object(nudge.git, "_git_dir", return_value=git_dir):
+                    with patch.object(nudge.git, "get_current_branch", return_value="feat"):
+                        nudge._save_snapshot(target="main", head="abcdef")
+
+                    snap = nudge._load_snapshot()
+                    assert snap is not None
+                    assert snap["head"] == "abcdef"
+                    assert snap["target"] == "main"
+
+                    nudge._clear_snapshot()
+                    assert nudge._load_snapshot() is None
+
+    def test_recovery_info(self):
+        config = Config()
+        config.api.api_key = "test-key"
+
+        with patch.object(Git, "_verify_repo"):
+            with tempfile.TemporaryDirectory() as tmpdir:
+                git_dir = Path(tmpdir) / ".git"
+                git_dir.mkdir()
+                nudge = GitNudge(config, repo_path=Path(tmpdir))
+                with patch.object(nudge.git, "_git_dir", return_value=git_dir):
+                    with patch.object(nudge.git, "get_current_branch", return_value="feat"):
+                        nudge._save_snapshot(target="main", head="abc123")
+                    with patch.object(nudge.git, "_run") as mock_run:
+                        mock_run.return_value = MagicMock(
+                            stdout="abc123 HEAD@{0} commit: msg\n", returncode=0
+                        )
+                        with patch.object(nudge.git, "get_head_sha", return_value="def456"):
+                            with patch.object(
+                                nudge.git, "get_current_branch", return_value="feat"
+                            ):
+                                info = nudge.get_recovery_info()
+
+                assert info["snapshot"]["head"] == "abc123"
+                assert "abc123" in info["reflog"]
+                assert info["current_head"] == "def456"
+
+    def test_status_includes_progress(self):
+        config = Config()
+        config.api.api_key = "test-key"
+
+        from gitnudge.git import RebaseProgress
+        prog = RebaseProgress(current=2, total=5, current_subject="fix bug", current_sha="abc")
+
+        with patch.object(Git, "_verify_repo"):
+            with tempfile.TemporaryDirectory() as tmpdir:
+                nudge = GitNudge(config, repo_path=Path(tmpdir))
+                with patch.object(
+                    nudge.git, "get_rebase_state", return_value=RebaseState.IN_PROGRESS
+                ):
+                    with patch.object(
+                        nudge.git, "get_current_branch", return_value="feat"
+                    ):
+                        with patch.object(
+                            nudge.git, "get_conflicted_files", return_value=[]
+                        ):
+                            with patch.object(
+                                nudge.git, "get_rebase_progress", return_value=prog
+                            ):
+                                status = nudge.get_status()
+
+        assert status["progress"] == {
+            "current": 2, "total": 5, "subject": "fix bug", "sha": "abc"
+        }
+
+    def test_continue_rebase_ai_verify_rejects_markers(self):
+        config = Config()
+        config.api.api_key = "test-key"
+
+        with patch.object(Git, "_verify_repo"):
+            with tempfile.TemporaryDirectory() as tmpdir:
+                bad = Path(tmpdir) / "bad.py"
+                bad.write_text("a\n<<<<<<< HEAD\nb\n=======\nc\n>>>>>>> x\n")
+                nudge = GitNudge(config, repo_path=Path(tmpdir))
+                with patch.object(
+                    nudge.git, "get_rebase_state", return_value=RebaseState.IN_PROGRESS
+                ):
+                    with patch.object(nudge.git, "get_conflicted_files", return_value=[]):
+                        with patch.object(nudge.git, "_run") as mock_run:
+                            mock_run.return_value = MagicMock(
+                                stdout="bad.py\n", returncode=0
+                            )
+                            with pytest.raises(GitNudgeError):
+                                nudge.continue_rebase(ai_verify=True)
 
 
 if __name__ == "__main__":
