@@ -48,6 +48,7 @@ def main(ctx: click.Context, no_color: bool) -> None:
 @click.option("-i", "--interactive", is_flag=True, help="Start interactive rebase")
 @click.option("--auto", is_flag=True, help="Auto-resolve conflicts with AI")
 @click.option("--dry-run", is_flag=True, help="Analyze without performing rebase")
+@click.option("--force", is_flag=True, help="Skip pre-flight safety checks (NOT recommended)")
 @click.pass_context
 def rebase(
     ctx: click.Context,
@@ -55,6 +56,7 @@ def rebase(
     interactive: bool,
     auto: bool,
     dry_run: bool,
+    force: bool,
 ) -> None:
     """Start an AI-assisted rebase onto TARGET.
 
@@ -120,7 +122,15 @@ def rebase(
             console=cons,
         ) as progress:
             progress.add_task("Rebasing...", total=None)
-            result = nudge.rebase(target, interactive, auto_resolve=auto)
+            result = nudge.rebase(
+                target, interactive, auto_resolve=auto, dry_run=dry_run, force=force
+            )
+
+        if result.safety_sha:
+            cons.print(f"\n[dim]Safety: pre-rebase HEAD = {result.safety_sha[:12]}[/dim]")
+            cons.print(
+                f"[dim]Recover with: git reset --hard {result.safety_sha[:12]}[/dim]"
+            )
 
         if result.success:
             cons.print(f"\n[green]✅ {result.message}[/green]")
@@ -133,6 +143,9 @@ def rebase(
                     cons.print(f"  • {conflict_file.path}")
 
                 cons.print("\n[dim]Use 'gitnudge resolve' for AI assistance[/dim]")
+
+        for w in result.warnings:
+            cons.print(f"[yellow]⚠️  {w}[/yellow]")
 
     except (GitError, GitNudgeError, ConfigError) as e:
         error_console.print(f"[red]Error:[/red] {e}")
@@ -168,11 +181,27 @@ def analyze(ctx: click.Context, target: str, detailed: bool) -> None:
             progress.add_task(f"Analyzing rebase onto {target}...", total=None)
             analysis = nudge.analyze(target)
 
+        if not analysis.has_merge_base:
+            cons.print(Panel(
+                f"[red]No common ancestor between {analysis.current_branch} "
+                f"and {analysis.target_branch}.[/red]\n"
+                "Refusing to analyze unrelated histories.",
+                title="📊 Rebase Analysis",
+            ))
+            return
+
+        status_line = ""
+        if analysis.is_up_to_date and not analysis.commits_to_rebase:
+            status_line = "\n[green]Already up to date with target.[/green]"
+        elif analysis.is_fast_forward:
+            status_line = "\n[cyan]Fast-forward possible (no rewrite needed).[/cyan]"
+
         cons.print(Panel(
             f"[bold]Current branch:[/bold] {analysis.current_branch}\n"
             f"[bold]Target branch:[/bold] {analysis.target_branch}\n"
             f"[bold]Merge base:[/bold] {analysis.merge_base[:8]}\n"
-            f"[bold]Commits to rebase:[/bold] {len(analysis.commits_to_rebase)}",
+            f"[bold]Commits to rebase:[/bold] {len(analysis.commits_to_rebase)}"
+            f"{status_line}",
             title="📊 Rebase Analysis",
         ))
 
@@ -285,9 +314,15 @@ def resolve(
             cons.print("[green]No conflicts to resolve[/green]")
             return
 
-        files_to_resolve = conflicted if resolve_all else (
-            [Path(file)] if file else [conflicted[0]]
-        )
+        if resolve_all:
+            files_to_resolve = conflicted
+        elif file:
+            requested = Path(file)
+            if not requested.is_absolute():
+                requested = nudge.git.repo_path / requested
+            files_to_resolve = [requested]
+        else:
+            files_to_resolve = [conflicted[0]]
 
         for conflict_path in files_to_resolve:
             cons.print(f"\n[bold]Analyzing conflict in {conflict_path}...[/bold]")
@@ -386,6 +421,81 @@ def continue_rebase(ctx: click.Context, ai_verify: bool) -> None:
 
 @main.command()
 @click.pass_context
+def skip(ctx: click.Context) -> None:
+    """Skip the current commit during a rebase.
+
+    Examples:
+
+        gitnudge skip
+    """
+    try:
+        config = Config.load()
+        if ctx.obj.get("no_color"):
+            config.ui.color = False
+
+        nudge = GitNudge(config)
+        cons = get_console(config)
+
+        if not click.confirm("Skip the current commit?"):
+            cons.print("[yellow]Cancelled[/yellow]")
+            return
+
+        result = nudge.skip_rebase()
+        if result.success:
+            cons.print(f"[green]✅ {result.message}[/green]")
+        else:
+            cons.print(f"[yellow]⚠️  {result.message}[/yellow]")
+            if result.conflicts:
+                for conflict in result.conflicts:
+                    cons.print(f"  • {conflict.path}")
+
+    except (GitError, GitNudgeError, ConfigError) as e:
+        error_console.print(f"[red]Error:[/red] {e}")
+        sys.exit(1)
+
+
+@main.command()
+@click.pass_context
+def recover(ctx: click.Context) -> None:
+    """Show how to recover the pre-rebase state.
+
+    Examples:
+
+        gitnudge recover
+    """
+    try:
+        config = Config.load()
+        if ctx.obj.get("no_color"):
+            config.ui.color = False
+
+        nudge = GitNudge(config)
+        cons = get_console(config)
+
+        info = nudge.get_recovery_info()
+        snapshot = info.get("snapshot")
+
+        if snapshot:
+            cons.print(Panel(
+                f"[bold]Pre-rebase HEAD:[/bold] {snapshot.get('head', '?')}\n"
+                f"[bold]Branch:[/bold] {snapshot.get('branch', '?')}\n"
+                f"[bold]Target:[/bold] {snapshot.get('target', '?')}\n\n"
+                f"[bold]Recover with:[/bold]\n"
+                f"  git reset --hard {snapshot.get('head', '?')[:12]}",
+                title="🛟  Recovery Snapshot",
+            ))
+        else:
+            cons.print("[yellow]No GitNudge snapshot found[/yellow]")
+
+        cons.print("\n[bold]Recent reflog (last 20):[/bold]")
+        cons.print(info.get("reflog", "").strip() or "(empty)")
+
+    except (GitError, GitNudgeError, ConfigError) as e:
+        error_console.print(f"[red]Error:[/red] {e}")
+        sys.exit(1)
+
+
+@main.command()
+@click.pass_context
 def abort(ctx: click.Context) -> None:
     """Abort the current rebase operation.
 
@@ -440,12 +550,27 @@ def status(ctx: click.Context) -> None:
 
         rebase_state = status_info['rebase_state']
         config_valid = '✅' if status_info['config_valid'] else '❌'
-        cons.print(Panel(
+
+        body = (
             f"[bold]Branch:[/bold] {status_info['current_branch']}\n"
             f"[bold]Rebase state:[/bold] [{state_color}]{rebase_state}[/{state_color}]\n"
-            f"[bold]Config valid:[/bold] {config_valid}",
-            title="📋 GitNudge Status",
-        ))
+            f"[bold]Config valid:[/bold] {config_valid}"
+        )
+
+        progress_info = status_info.get("progress")
+        if progress_info:
+            body += (
+                f"\n[bold]Progress:[/bold] commit "
+                f"{progress_info['current']}/{progress_info['total']}"
+            )
+            if progress_info.get("subject"):
+                body += f"\n[bold]Applying:[/bold] {progress_info['subject'][:80]}"
+
+        safety = status_info.get("safety_sha")
+        if safety:
+            body += f"\n[bold]Safety SHA:[/bold] {safety[:12]} (run 'gitnudge recover')"
+
+        cons.print(Panel(body, title="📋 GitNudge Status"))
 
         if status_info["conflicted_files"]:
             cons.print("\n[bold]Conflicted files:[/bold]")
@@ -517,7 +642,11 @@ def config(
         cons.print(f"[yellow]Could not load config: {e}[/yellow]")
         cfg = Config()
 
-    masked_key = "****" + cfg.api.api_key[-4:] if cfg.api.api_key else "(not set)"
+    if cfg.api.api_key:
+        suffix = cfg.api.api_key[-4:] if len(cfg.api.api_key) >= 8 else ""
+        masked_key = "****" + suffix if suffix else "**** (set)"
+    else:
+        masked_key = "(not set)"
 
     cons.print(Panel(
         f"[bold]API Key:[/bold] {masked_key}\n"

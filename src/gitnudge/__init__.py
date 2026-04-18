@@ -1,6 +1,6 @@
 """GitNudge - AI-Powered Git Rebase Assistant."""
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 __author__ = "GitNudge Contributors"
 
 from gitnudge.config import Config
