@@ -158,15 +158,16 @@ def analyze_conflict(
 ```
 gitnudge/
 ├── src/gitnudge/
-│   ├── __init__.py         # Package initialization
-│   ├── cli.py              # Command-line interface (click)
-│   ├── config.py           # Pydantic configuration models + load/save
+│   ├── __init__.py         # Package init; __version__ sourced from package metadata
+│   ├── __main__.py         # Enables `python -m gitnudge`
+│   ├── cli.py              # Command-line interface (click) + global --verbose/--quiet
+│   ├── config.py           # Pydantic configuration models + atomic load/save
 │   ├── core.py             # Main GitNudge class (rebase orchestration, snapshot, recovery)
 │   ├── git.py              # Git operations wrapper (ref validation, progress, skip, etc.)
 │   ├── ai.py               # Claude integration + pydantic AI response models
 │   └── logging_utils.py    # Structured logging with API-key redaction
 ├── tests/
-│   └── test_gitnudge.py    # 100+ unit tests
+│   └── test_gitnudge.py    # 134 unit tests
 ├── .github/workflows/
 │   ├── lint.yml            # ruff + mypy on push & PR
 │   ├── test.yml            # pytest on Python 3.9–3.12, ubuntu + macos
@@ -180,7 +181,7 @@ gitnudge/
 
 ## Bump and release
 
-1. Update `version` in `pyproject.toml` and `__version__` in `src/gitnudge/__init__.py`.
+1. Update `version` in `pyproject.toml` (`__version__` is read from package metadata, no other file to edit).
 2. Add a new section at the top of `CHANGELOG.md` (Added / Changed / Fixed / Security).
 3. Open a PR. Once merged to `main`, the `publish.yml` workflow tags the release automatically.
 
