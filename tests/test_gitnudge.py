@@ -1588,7 +1588,17 @@ class TestCLI:
         runner = CliRunner()
         result = runner.invoke(main, ["--version"])
         assert result.exit_code == 0
-        assert "0." in result.output
+        assert "." in result.output
+
+    def test_cli_version_matches_package(self):
+        from click.testing import CliRunner
+
+        from gitnudge import __version__
+        from gitnudge.cli import main
+        runner = CliRunner()
+        result = runner.invoke(main, ["--version"])
+        assert result.exit_code == 0
+        assert __version__ in result.output
 
     def test_cli_help(self):
         from click.testing import CliRunner
@@ -1599,6 +1609,46 @@ class TestCLI:
         assert result.exit_code == 0
         assert "rebase" in result.output
         assert "config" in result.output
+        assert "explain" in result.output
+
+    def test_cli_explain_no_rebase(self):
+        from click.testing import CliRunner
+
+        from gitnudge.cli import main
+        runner = CliRunner()
+        cfg = Config()
+        cfg.api.api_key = "test-key"
+        with patch("gitnudge.cli.Config.load", return_value=cfg):
+            with patch.object(Git, "_verify_repo"):
+                with patch.object(Git, "get_rebase_state", return_value=RebaseState.NONE):
+                    result = runner.invoke(main, ["explain"])
+            assert result.exit_code == 0
+            assert "No rebase" in result.output
+
+    def test_cli_verbose_and_quiet_conflict(self):
+        from click.testing import CliRunner
+
+        from gitnudge.cli import main
+        runner = CliRunner()
+        result = runner.invoke(main, ["--verbose", "--quiet", "status"])
+        assert result.exit_code == 2
+        assert "mutually exclusive" in result.output
+
+    def test_cli_verbose_sets_verbosity(self):
+        from click.testing import CliRunner
+
+        from gitnudge.cli import main
+        runner = CliRunner()
+        cfg = Config()
+        cfg.api.api_key = "test-key"
+        with patch("gitnudge.cli.Config.load", return_value=cfg):
+            with patch.object(Git, "_verify_repo"):
+                with patch.object(Git, "get_current_branch", return_value="main"):
+                    with patch.object(Git, "get_rebase_state", return_value=RebaseState.NONE):
+                        with patch.object(Git, "get_conflicted_files", return_value=[]):
+                            result = runner.invoke(main, ["--verbose", "status"])
+            assert result.exit_code == 0
+            assert cfg.ui.verbosity == "verbose"
 
     def test_cli_status_smoke(self):
         from click.testing import CliRunner
@@ -1614,6 +1664,13 @@ class TestCLI:
                         with patch.object(Git, "get_conflicted_files", return_value=[]):
                             result = runner.invoke(main, ["status"])
             assert result.exit_code == 0
+
+    def test_python_dash_m_entrypoint(self):
+        """`python -m gitnudge` should be importable and expose main."""
+        import importlib
+
+        mod = importlib.import_module("gitnudge.__main__")
+        assert hasattr(mod, "main")
 
 
 class TestRebaseFeatures:
@@ -1818,6 +1875,39 @@ class TestRebaseFeatures:
             "current": 2, "total": 5, "subject": "fix bug", "sha": "abc"
         }
 
+    def test_continue_rebase_applied_count_on_completion(self):
+        """Applied count at rebase completion = before_total - before_done."""
+        from gitnudge.git import RebaseProgress
+        config = Config()
+        config.api.api_key = "test-key"
+
+        before = RebaseProgress(current=2, total=5, current_subject="x", current_sha="a")
+
+        with patch.object(Git, "_verify_repo"):
+            with tempfile.TemporaryDirectory() as tmpdir:
+                git_dir = Path(tmpdir) / ".git"
+                git_dir.mkdir()
+                nudge = GitNudge(config, repo_path=Path(tmpdir))
+
+                state_calls = [RebaseState.IN_PROGRESS, RebaseState.NONE]
+                progress_calls = [before, None]
+                with patch.object(nudge.git, "_git_dir", return_value=git_dir):
+                    with patch.object(
+                        nudge.git, "get_rebase_state", side_effect=state_calls
+                    ):
+                        with patch.object(nudge.git, "get_conflicted_files", return_value=[]):
+                            with patch.object(
+                                nudge.git, "get_rebase_progress", side_effect=progress_calls
+                            ):
+                                with patch.object(
+                                    nudge.git, "continue_rebase", return_value=True
+                                ):
+                                    result = nudge.continue_rebase()
+
+        assert result.success is True
+        assert result.commits_applied == 3
+        assert "applied 3 more" in result.message
+
     def test_continue_rebase_ai_verify_rejects_markers(self):
         config = Config()
         config.api.api_key = "test-key"
@@ -1837,6 +1927,300 @@ class TestRebaseFeatures:
                             )
                             with pytest.raises(GitNudgeError):
                                 nudge.continue_rebase(ai_verify=True)
+
+
+class TestV1Fixes:
+    """Tests for the 0.3.0 hardening round: ref validator, snapshot atomicity, skip off-by-one."""
+
+    def test_ref_validator_rejects_double_dot(self):
+        from gitnudge.git import _is_safe_ref
+        assert not _is_safe_ref("..main")
+        assert not _is_safe_ref("main..other")
+
+    def test_ref_validator_rejects_at_brace(self):
+        from gitnudge.git import _is_safe_ref
+        assert not _is_safe_ref("HEAD@{upstream}")
+
+    def test_ref_validator_rejects_leading_slash_or_colon(self):
+        from gitnudge.git import _is_safe_ref
+        assert not _is_safe_ref("/etc/passwd")
+        assert not _is_safe_ref(":refs/heads/main")
+
+    def test_ref_validator_rejects_lock_suffix(self):
+        from gitnudge.git import _is_safe_ref
+        assert not _is_safe_ref("main.lock")
+        assert not _is_safe_ref("main.")
+
+    def test_ref_validator_accepts_common_refs(self):
+        from gitnudge.git import _is_safe_ref
+        assert _is_safe_ref("main")
+        assert _is_safe_ref("HEAD")
+        assert _is_safe_ref("HEAD~5")
+        assert _is_safe_ref("HEAD^")
+        assert _is_safe_ref("origin/main")
+        assert _is_safe_ref("feature/x-y-z")
+        assert _is_safe_ref("v1.0.0")
+        assert _is_safe_ref("abc123def456")
+
+    def test_save_snapshot_atomic_no_partial_on_crash(self, tmp_path):
+        config = Config()
+        config.api.api_key = "test-key"
+
+        with patch.object(Git, "_verify_repo"):
+            git_dir = tmp_path / ".git"
+            git_dir.mkdir()
+            nudge = GitNudge(config, repo_path=tmp_path)
+
+            with patch.object(nudge.git, "_git_dir", return_value=git_dir):
+                with patch.object(nudge.git, "get_current_branch", return_value="feat"):
+                    with patch(
+                        "gitnudge.core.os.replace",
+                        side_effect=OSError("disk full"),
+                    ):
+                        nudge._save_snapshot(target="main", head="abc123")
+
+            snap = git_dir / GitNudge.SNAPSHOT_NAME
+            assert not snap.exists()
+            tmps = list(git_dir.glob(".gitnudge-snapshot.*.tmp"))
+            assert tmps == []
+
+    def test_save_snapshot_atomic_success(self, tmp_path):
+        config = Config()
+        config.api.api_key = "test-key"
+
+        with patch.object(Git, "_verify_repo"):
+            git_dir = tmp_path / ".git"
+            git_dir.mkdir()
+            nudge = GitNudge(config, repo_path=tmp_path)
+
+            with patch.object(nudge.git, "_git_dir", return_value=git_dir):
+                with patch.object(nudge.git, "get_current_branch", return_value="feat"):
+                    nudge._save_snapshot(target="main", head="abcdef0123456789")
+
+            snap_path = git_dir / GitNudge.SNAPSHOT_NAME
+            assert snap_path.exists()
+            import json as _json
+            loaded = _json.loads(snap_path.read_text())
+            assert loaded["head"] == "abcdef0123456789"
+            assert loaded["target"] == "main"
+            assert loaded["branch"] == "feat"
+            assert "timestamp" in loaded
+
+    def test_skip_rebase_remaining_not_off_by_one(self):
+        """Remaining count must include the new current commit."""
+        from gitnudge.git import RebaseProgress
+        config = Config()
+        config.api.api_key = "test-key"
+
+        prog = RebaseProgress(current=3, total=5, current_subject="x", current_sha="a")
+
+        with patch.object(Git, "_verify_repo"):
+            nudge = GitNudge(config)
+            state_calls = [RebaseState.CONFLICT, RebaseState.IN_PROGRESS]
+            with patch.object(nudge.git, "get_rebase_state", side_effect=state_calls):
+                with patch.object(nudge.git, "skip_rebase", return_value=True):
+                    with patch.object(nudge.git, "get_rebase_progress", return_value=prog):
+                        result = nudge.skip_rebase()
+
+        assert result.success is True
+        assert "3 remaining" in result.message
+
+    def test_redacting_filter_scrubs_args(self, caplog):
+        import logging
+
+        from gitnudge.logging_utils import _RedactingFilter
+        logger = logging.getLogger("gitnudge.test_redact")
+        logger.addFilter(_RedactingFilter())
+        logger.setLevel(logging.INFO)
+
+        with caplog.at_level(logging.INFO, logger="gitnudge.test_redact"):
+            logger.info("key=%s", "sk-ant-api03-ABCDEFGHIJKLMNOP")
+            logger.info("plain sk-ant-api03-XYZ12345 text")
+
+        all_msgs = [r.getMessage() for r in caplog.records]
+        for m in all_msgs:
+            assert "sk-ant-api03-ABCDEFGHIJKLMNOP" not in m
+            assert "sk-ant-api03-XYZ12345" not in m
+            assert "REDACTED" in m
+
+    def test_redacting_filter_survives_bad_args(self):
+        import logging
+
+        from gitnudge.logging_utils import _RedactingFilter
+        rec = logging.LogRecord(
+            name="x", level=logging.INFO, pathname="", lineno=1,
+            msg="bad %s %s", args=("only-one",), exc_info=None,
+        )
+        f = _RedactingFilter()
+        assert f.filter(rec) is True
+
+    def test_analyze_no_longer_accepts_detailed_kwarg(self):
+        """The dead 'detailed' kwarg on GitNudge.analyze was removed."""
+        config = Config()
+        config.api.api_key = "test-key"
+
+        with patch.object(Git, "_verify_repo"):
+            nudge = GitNudge(config)
+            with patch.object(nudge.git, "analyze_rebase") as m:
+                m.return_value = RebaseAnalysis(
+                    current_branch="f", target_branch="main",
+                    commits_to_rebase=[], potential_conflicts=[],
+                    merge_base="b",
+                )
+                with pytest.raises(TypeError):
+                    nudge.analyze("main", detailed=True)  # type: ignore[call-arg]
+
+    def test_rebase_result_has_applied_resolutions_field(self):
+        from gitnudge.core import RebaseResult
+        r = RebaseResult(success=True, commits_applied=0, conflicts_resolved=0, message="ok")
+        assert r.applied_resolutions == []
+
+    def test_auto_resolve_records_applied_resolutions(self):
+        config = Config()
+        config.api.api_key = "test-key"
+
+        analysis = RebaseAnalysis(
+            current_branch="feature",
+            target_branch="main",
+            commits_to_rebase=[Commit("sha1", "s1", "msg", "author", "date", [])],
+            potential_conflicts=[],
+            merge_base="base123",
+        )
+        conflict_file = ConflictFile(
+            path=Path("test.py"), ours_content="o", theirs_content="t",
+            base_content="b", conflict_markers=[],
+        )
+        resolution = ConflictResolution(
+            file_path="test.py", resolved_content="resolved",
+            explanation="e", confidence="high", changes_summary="merged both sides",
+        )
+
+        with patch.object(Git, "_verify_repo"):
+            nudge = GitNudge(config)
+            states = [RebaseState.CONFLICT, RebaseState.NONE]
+            conflicted_calls = [[Path("test.py")], []]
+            with patch.object(nudge, "preflight", return_value=[]):
+                with patch.object(nudge.git, "get_rebase_state", side_effect=states):
+                    with patch.object(nudge.git, "analyze_rebase", return_value=analysis):
+                        with patch.object(nudge.git, "get_head_sha", return_value="safe"):
+                            with patch.object(nudge.git, "start_rebase", return_value=False):
+                                with patch.object(nudge, "_save_snapshot"):
+                                    with patch.object(
+                                        nudge.git, "get_conflicted_files",
+                                        side_effect=conflicted_calls,
+                                    ):
+                                        with patch.object(
+                                            nudge.git, "get_conflict_details",
+                                            return_value=conflict_file,
+                                        ):
+                                            with patch.object(
+                                                nudge, "resolve_conflict",
+                                                return_value=resolution,
+                                            ):
+                                                with patch.object(
+                                                    nudge.git, "continue_rebase",
+                                                    return_value=True,
+                                                ):
+                                                    with patch.object(nudge, "apply_resolution"):
+                                                        result = nudge.rebase(
+                                                            "main", auto_resolve=True
+                                                        )
+
+        assert result.success is True
+        assert len(result.applied_resolutions) == 1
+        entry = result.applied_resolutions[0]
+        assert entry["confidence"] == "high"
+        assert "merged" in entry["summary"]
+
+
+class TestV1Regressions:
+    """Tests for issues found during the v0.3.0 re-review (#21-#30)."""
+
+    def _bare_ai(self):
+        from gitnudge.ai import AIAssistant
+        return object.__new__(AIAssistant)
+
+    def test_extract_section_line_anchored(self):
+        """#21: header must be at line start; prose 'explanation:' must not match."""
+        from gitnudge.ai import AIAssistant
+        ai = self._bare_ai()
+        text = (
+            "Some intro with an explanation: lower-case prose.\n"
+            "EXPLANATION:\n"
+            "This is the real body.\n"
+            "CONFIDENCE: high\n"
+        )
+        out = AIAssistant._extract_section.__get__(ai)(text, "EXPLANATION:")
+        assert out == "This is the real body."
+
+    def test_parse_rebase_should_proceed_yes_with_caveats(self):
+        """#22: 'Yes, with caveats' should be parsed as True."""
+        from gitnudge.ai import AIAssistant
+        ai = self._bare_ai()
+        text = (
+            "SHOULD_PROCEED: Yes, with caveats\n"
+            "RISK_LEVEL: medium\n"
+            "EXPLANATION: x\n"
+            "SUGGESTED_APPROACH: y\n"
+            "WARNINGS: none\n"
+        )
+        rec = AIAssistant._parse_rebase_response.__get__(ai)(text)
+        assert rec.should_proceed is True
+
+    def test_parse_rebase_should_proceed_no_period(self):
+        """#22: 'No.' should be parsed as False."""
+        from gitnudge.ai import AIAssistant
+        ai = self._bare_ai()
+        text = (
+            "SHOULD_PROCEED: No.\n"
+            "RISK_LEVEL: high\n"
+            "EXPLANATION: x\n"
+            "SUGGESTED_APPROACH: y\n"
+            "WARNINGS: none\n"
+        )
+        rec = AIAssistant._parse_rebase_response.__get__(ai)(text)
+        assert rec.should_proceed is False
+
+    def test_is_safe_ref_trailing_slash_rejected(self):
+        """#23: 'foo/' must be rejected (git rejects trailing slash)."""
+        from gitnudge.git import _is_safe_ref
+        assert _is_safe_ref("foo/") is False
+        assert _is_safe_ref("refs/heads/") is False
+        assert _is_safe_ref("refs/heads/main") is True
+
+    def test_confidence_trailing_punctuation(self):
+        """#27: 'high.' should normalize to 'high'."""
+        from gitnudge.ai import ConflictResolution
+        r = ConflictResolution(file_path="x", resolved_content="x", confidence="high.")
+        assert r.confidence == "high"
+        r = ConflictResolution(file_path="x", resolved_content="x", confidence=" HIGH!!")
+        assert r.confidence == "high"
+
+    def test_risk_level_trailing_punctuation(self):
+        """#27: 'medium.' should normalize to 'medium'."""
+        from gitnudge.ai import RebaseRecommendation
+        r = RebaseRecommendation(risk_level="medium.")
+        assert r.risk_level == "medium"
+        r = RebaseRecommendation(risk_level=" LOW,")
+        assert r.risk_level == "low"
+
+    def test_full_content_logs_os_error(self, caplog):
+        """#29: missing conflict file should log a warning, not return silently."""
+        import logging
+        from pathlib import Path
+
+        from gitnudge.git import ConflictFile
+        cf = ConflictFile(
+            path=Path("/nonexistent/definitely/not/here.xyz"),
+            ours_content="", theirs_content="", base_content="",
+            conflict_markers=[],
+        )
+        logger = logging.getLogger("gitnudge.git")
+        logger.propagate = True
+        with caplog.at_level(logging.WARNING, logger="gitnudge.git"):
+            out = cf.full_content
+        assert out == ""
+        assert any("Could not read conflict file" in rec.message for rec in caplog.records)
 
 
 if __name__ == "__main__":

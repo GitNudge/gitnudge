@@ -33,7 +33,8 @@ class ConflictResolution(BaseModel):
     @field_validator("confidence", mode="before")
     @classmethod
     def _normalize_confidence(cls, v: object) -> str:
-        s = str(v or "").strip().lower()
+        s = str(v or "").strip().lower().strip(".,;:!?\"'`*")
+        s = s.split(None, 1)[0] if s else ""
         return s if s in ("high", "medium", "low") else "medium"
 
 
@@ -51,7 +52,8 @@ class RebaseRecommendation(BaseModel):
     @field_validator("risk_level", mode="before")
     @classmethod
     def _normalize_risk(cls, v: object) -> str:
-        s = str(v or "").strip().lower()
+        s = str(v or "").strip().lower().strip(".,;:!?\"'`*")
+        s = s.split(None, 1)[0] if s else ""
         return s if s in ("low", "medium", "high") else "medium"
 
 
@@ -95,6 +97,7 @@ class AIAssistant:
     def analyze_conflict(self, conflict: ConflictFile, context: str = "") -> ConflictResolution:
         """Analyze a conflict and suggest a resolution."""
         max_chars = max(self.config.behavior.max_context_lines, 10) * 80
+        full_content = conflict.full_content
         prompt = f"""Analyze this git merge conflict and suggest a resolution.
 
 ## File: {conflict.path.name}
@@ -116,7 +119,7 @@ class AIAssistant:
 
 ### Current file with conflict markers:
 ```
-{self._truncate(conflict.full_content, max_chars)}
+{self._truncate(full_content, max_chars)}
 ```
 
 {f"### Additional context:{chr(10)}{context}" if context else ""}
@@ -264,8 +267,9 @@ Keep your explanation concise and actionable."""
 
     def _parse_rebase_response(self, response: str) -> RebaseRecommendation:
         """Parse the AI response for rebase recommendation."""
-        should_proceed_text = self._extract_section(response, "SHOULD_PROCEED:").strip().lower()
-        should_proceed = should_proceed_text in ("yes", "true", "proceed")
+        sp_text = self._extract_section(response, "SHOULD_PROCEED:").strip().lower()
+        first_token = sp_text.split(None, 1)[0].strip(".,;:!?") if sp_text else ""
+        should_proceed = first_token in ("yes", "true", "proceed", "y")
 
         risk_level = self._extract_section(response, "RISK_LEVEL:").strip().lower()
         explanation = self._extract_section(response, "EXPLANATION:")
@@ -301,12 +305,26 @@ Keep your explanation concise and actionable."""
         "WARNINGS:",
     )
 
+    @staticmethod
+    def _find_header(text_lower: str, header_lower: str) -> int:
+        """Find a header only at the start of a line (prevents prose-word collisions)."""
+        pos = 0
+        n = len(text_lower)
+        while pos < n:
+            idx = text_lower.find(header_lower, pos)
+            if idx == -1:
+                return -1
+            if idx == 0 or text_lower[idx - 1] in ("\n", "\r"):
+                return idx
+            pos = idx + 1
+        return -1
+
     def _extract_section(self, text: str, header: str) -> str:
-        """Extract a section from the response text (case-insensitive)."""
+        """Extract a section from the response text (case-insensitive, line-anchored)."""
         header_lower = header.lower()
         text_lower = text.lower()
 
-        start = text_lower.find(header_lower)
+        start = self._find_header(text_lower, header_lower)
         if start == -1:
             return ""
 
@@ -317,9 +335,11 @@ Keep your explanation concise and actionable."""
             nh_lower = next_header.lower()
             if nh_lower == header_lower:
                 continue
-            pos = text_lower.find(nh_lower, body_start)
-            if pos != -1 and pos < end:
-                end = pos
+            pos = self._find_header(text_lower[body_start:], nh_lower)
+            if pos != -1:
+                abs_pos = body_start + pos
+                if abs_pos < end:
+                    end = abs_pos
 
         return text[body_start:end].strip()
 

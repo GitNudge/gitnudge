@@ -32,15 +32,32 @@ def get_console(config: Config | None = None) -> Console:
 @click.group()
 @click.version_option(version=__version__)
 @click.option("--no-color", is_flag=True, help="Disable colored output")
+@click.option("-v", "--verbose", is_flag=True, help="Verbose output (sets verbosity=verbose)")
+@click.option("-q", "--quiet", is_flag=True, help="Quiet output (sets verbosity=quiet)")
 @click.pass_context
-def main(ctx: click.Context, no_color: bool) -> None:
+def main(ctx: click.Context, no_color: bool, verbose: bool, quiet: bool) -> None:
     """GitNudge - AI-Powered Git Rebase Assistant
 
     Use Claude AI to help with git rebase operations, conflict resolution,
     and understanding complex merges.
     """
+    if verbose and quiet:
+        error_console.print("[red]Error:[/red] --verbose and --quiet are mutually exclusive")
+        sys.exit(2)
+
     ctx.ensure_object(dict)
     ctx.obj["no_color"] = no_color
+    ctx.obj["verbosity"] = "verbose" if verbose else ("quiet" if quiet else None)
+
+
+def _apply_cli_overrides(ctx: click.Context, config: Config) -> Config:
+    """Apply global CLI flags onto the loaded config."""
+    if ctx.obj.get("no_color"):
+        config.ui.color = False
+    verbosity = ctx.obj.get("verbosity")
+    if verbosity:
+        config.ui.verbosity = verbosity
+    return config
 
 
 @main.command()
@@ -69,9 +86,7 @@ def rebase(
         gitnudge rebase --dry-run main
     """
     try:
-        config = Config.load()
-        if ctx.obj.get("no_color"):
-            config.ui.color = False
+        config = _apply_cli_overrides(ctx, Config.load())
 
         nudge = GitNudge(config)
         cons = get_console(config)
@@ -144,6 +159,15 @@ def rebase(
 
                 cons.print("\n[dim]Use 'gitnudge resolve' for AI assistance[/dim]")
 
+        if result.applied_resolutions:
+            cons.print("\n[bold]AI-resolved conflicts:[/bold]")
+            for entry in result.applied_resolutions:
+                summary = entry.get("summary") or "(no summary)"
+                cons.print(
+                    f"  • [cyan]{entry['file']}[/cyan] "
+                    f"[dim]({entry.get('confidence', '?')})[/dim] — {summary}"
+                )
+
         for w in result.warnings:
             cons.print(f"[yellow]⚠️  {w}[/yellow]")
 
@@ -166,9 +190,7 @@ def analyze(ctx: click.Context, target: str, detailed: bool) -> None:
         gitnudge analyze --detailed feature-branch
     """
     try:
-        config = Config.load()
-        if ctx.obj.get("no_color"):
-            config.ui.color = False
+        config = _apply_cli_overrides(ctx, Config.load())
 
         nudge = GitNudge(config)
         cons = get_console(config)
@@ -297,9 +319,7 @@ def resolve(
         gitnudge resolve --auto --all
     """
     try:
-        config = Config.load()
-        if ctx.obj.get("no_color"):
-            config.ui.color = False
+        config = _apply_cli_overrides(ctx, Config.load())
 
         nudge = GitNudge(config)
         cons = get_console(config)
@@ -320,6 +340,17 @@ def resolve(
             requested = Path(file)
             if not requested.is_absolute():
                 requested = nudge.git.repo_path / requested
+            try:
+                requested_resolved = requested.resolve()
+            except OSError:
+                requested_resolved = requested
+            conflicted_resolved = {c.resolve() for c in conflicted}
+            if requested_resolved not in conflicted_resolved:
+                error_console.print(
+                    f"[red]Error:[/red] {file} is not in the conflicted file list. "
+                    f"Run 'gitnudge status' to see current conflicts."
+                )
+                sys.exit(1)
             files_to_resolve = [requested]
         else:
             files_to_resolve = [conflicted[0]]
@@ -383,8 +414,72 @@ def resolve(
         sys.exit(1)
 
 
+@main.command()
+@click.argument("file", required=False)
+@click.pass_context
+def explain(ctx: click.Context, file: str | None) -> None:
+    """Ask Claude to explain a conflict in plain language.
+
+    Examples:
+
+        gitnudge explain
+
+        gitnudge explain src/utils.py
+    """
+    try:
+        config = _apply_cli_overrides(ctx, Config.load())
+
+        nudge = GitNudge(config)
+        cons = get_console(config)
+
+        state = nudge.git.get_rebase_state()
+        if state == RebaseState.NONE:
+            cons.print("[yellow]No rebase in progress[/yellow]")
+            return
+
+        conflicted = nudge.git.get_conflicted_files()
+        if not conflicted:
+            cons.print("[green]No conflicts to explain[/green]")
+            return
+
+        if file:
+            target_file = Path(file)
+            if not target_file.is_absolute():
+                target_file = nudge.git.repo_path / target_file
+            try:
+                target_resolved = target_file.resolve()
+            except OSError:
+                target_resolved = target_file
+            conflicted_resolved = {c.resolve() for c in conflicted}
+            if target_resolved not in conflicted_resolved:
+                error_console.print(
+                    f"[red]Error:[/red] {file} is not in the conflicted file list."
+                )
+                sys.exit(1)
+        else:
+            target_file = conflicted[0]
+
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            console=cons,
+        ) as progress:
+            progress.add_task(f"Asking Claude about {target_file.name}...", total=None)
+            explanation = nudge.explain_conflict(target_file)
+
+        cons.print(Panel(explanation, title=f"🤖 Conflict in {target_file.name}"))
+
+    except (GitError, GitNudgeError, ConfigError) as e:
+        error_console.print(f"[red]Error:[/red] {e}")
+        sys.exit(1)
+
+
 @main.command("continue")
-@click.option("--ai-verify", is_flag=True, help="Verify resolution with AI first")
+@click.option(
+    "--ai-verify",
+    is_flag=True,
+    help="Refuse to continue if any staged file still contains conflict markers",
+)
 @click.pass_context
 def continue_rebase(ctx: click.Context, ai_verify: bool) -> None:
     """Continue the rebase after resolving conflicts.
@@ -396,9 +491,7 @@ def continue_rebase(ctx: click.Context, ai_verify: bool) -> None:
         gitnudge continue --ai-verify
     """
     try:
-        config = Config.load()
-        if ctx.obj.get("no_color"):
-            config.ui.color = False
+        config = _apply_cli_overrides(ctx, Config.load())
 
         nudge = GitNudge(config)
         cons = get_console(config)
@@ -429,9 +522,7 @@ def skip(ctx: click.Context) -> None:
         gitnudge skip
     """
     try:
-        config = Config.load()
-        if ctx.obj.get("no_color"):
-            config.ui.color = False
+        config = _apply_cli_overrides(ctx, Config.load())
 
         nudge = GitNudge(config)
         cons = get_console(config)
@@ -464,9 +555,7 @@ def recover(ctx: click.Context) -> None:
         gitnudge recover
     """
     try:
-        config = Config.load()
-        if ctx.obj.get("no_color"):
-            config.ui.color = False
+        config = _apply_cli_overrides(ctx, Config.load())
 
         nudge = GitNudge(config)
         cons = get_console(config)
@@ -504,9 +593,7 @@ def abort(ctx: click.Context) -> None:
         gitnudge abort
     """
     try:
-        config = Config.load()
-        if ctx.obj.get("no_color"):
-            config.ui.color = False
+        config = _apply_cli_overrides(ctx, Config.load())
 
         nudge = GitNudge(config)
         cons = get_console(config)
@@ -532,9 +619,7 @@ def status(ctx: click.Context) -> None:
         gitnudge status
     """
     try:
-        config = Config.load()
-        if ctx.obj.get("no_color"):
-            config.ui.color = False
+        config = _apply_cli_overrides(ctx, Config.load())
 
         nudge = GitNudge(config)
         cons = get_console(config)
@@ -624,6 +709,10 @@ def config(
             cfg.api.api_key = api_key
             cfg.save()
             cons.print(f"[green]✅ API key saved to {CONFIG_FILE}[/green]")
+            cons.print(
+                "[dim]Note: key is stored in plaintext (file chmod 0600). "
+                "Prefer setting ANTHROPIC_API_KEY env var for shared machines.[/dim]"
+            )
         return
 
     if model:

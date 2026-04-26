@@ -4,7 +4,7 @@
 
 [![Lint](https://github.com/GitNudge/gitnudge/actions/workflows/lint.yml/badge.svg)](https://github.com/GitNudge/gitnudge/actions/workflows/lint.yml)
 [![Test](https://github.com/GitNudge/gitnudge/actions/workflows/test.yml/badge.svg)](https://github.com/GitNudge/gitnudge/actions/workflows/test.yml)
-[![Version](https://img.shields.io/badge/version-0.2.0-blue.svg)](https://github.com/GitNudge/gitnudge/releases)
+[![Version](https://img.shields.io/badge/version-0.3.0-blue.svg)](https://github.com/GitNudge/gitnudge/releases)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://www.python.org/downloads/)
 
@@ -32,7 +32,7 @@ GitNudge is an open-source CLI tool that helps you perform git rebases with the 
 pip install git+https://github.com/GitNudge/gitnudge.git
 
 # Install a specific tag/release
-pip install git+https://github.com/GitNudge/gitnudge.git@v0.2.0
+pip install git+https://github.com/GitNudge/gitnudge.git@v0.3.0
 ```
 
 ### From source
@@ -68,6 +68,11 @@ gitnudge rebase -i HEAD~5
 gitnudge analyze main
 ```
 
+You can also invoke the CLI via the module form: `python -m gitnudge ...`.
+
+Global flags: `--verbose` / `-v`, `--quiet` / `-q`, and `--no-color` may be
+placed before any subcommand (e.g. `gitnudge --verbose status`).
+
 ## Commands
 
 ### `gitnudge rebase <target>`
@@ -100,6 +105,15 @@ gitnudge resolve                  # Resolve the first conflict
 gitnudge resolve src/utils.py     # Resolve a specific file
 gitnudge resolve --all            # Walk through all conflicts
 gitnudge resolve --auto           # Auto-apply suggestions without confirmation
+```
+
+### `gitnudge explain [file]`
+
+Ask Claude to explain a conflict in plain language, without proposing a resolution.
+
+```bash
+gitnudge explain                  # Explain the first conflict
+gitnudge explain src/utils.py     # Explain a specific file
 ```
 
 ### `gitnudge continue`

@@ -15,12 +15,28 @@ log = get_logger(__name__)
 
 _REF_RE = re.compile(r"^[A-Za-z0-9_./\-@~^{}:+]+$")
 
+_REF_FORBIDDEN_SUBSTRINGS = ("..", "//", "@{", "\\")
+
 
 def _is_safe_ref(ref: str) -> bool:
-    """Conservative ref/branch name validator to prevent argv injection-like surprises."""
-    if not ref or ref.startswith("-"):
+    """Conservative ref/branch/rev-spec validator.
+
+    Accepts typical refs/branches/tags/sha/``HEAD~N``/``HEAD^`` etc.,
+    and rejects:
+    - empty / leading ``-`` (argv-flag injection)
+    - whitespace (shell-word-splitting surprises)
+    - leading ``:`` or ``/`` (refspec-ish / root path escape)
+    - ``..``, ``//``, ``@{``, backslash (not valid in refs we want to accept)
+    - trailing ``.lock`` / ``.`` / ``/`` (git rejects these too)
+    - any char outside the conservative allow-list
+    """
+    if not ref or ref.startswith(("-", ":", "/")):
         return False
     if any(c.isspace() for c in ref):
+        return False
+    if any(bad in ref for bad in _REF_FORBIDDEN_SUBSTRINGS):
+        return False
+    if ref.endswith((".lock", ".", "/")):
         return False
     return bool(_REF_RE.match(ref))
 
@@ -49,7 +65,8 @@ class ConflictFile:
         """Get the full file content with conflict markers."""
         try:
             return self.path.read_text()
-        except OSError:
+        except OSError as e:
+            log.warning("Could not read conflict file %s: %s", self.path, e)
             return ""
 
 

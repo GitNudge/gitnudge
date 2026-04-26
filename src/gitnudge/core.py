@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -32,6 +34,7 @@ class RebaseResult:
     conflicts: list[ConflictFile] | None = None
     safety_sha: str | None = None
     warnings: list[str] = field(default_factory=list)
+    applied_resolutions: list[dict[str, str]] = field(default_factory=list)
 
 
 def _has_conflict_markers(text: str) -> bool:
@@ -62,7 +65,7 @@ class GitNudge:
             self._ai = AIAssistant(self.config)
         return self._ai
 
-    def analyze(self, target: str, detailed: bool = False) -> RebaseAnalysis:
+    def analyze(self, target: str) -> RebaseAnalysis:
         """Analyze a potential rebase operation."""
         return self.git.analyze_rebase(target)
 
@@ -156,6 +159,7 @@ class GitNudge:
             )
 
         conflicts_resolved = 0
+        applied_resolutions: list[dict[str, str]] = []
         max_iterations = max(commits_to_apply * 3, 20)
         iterations = 0
 
@@ -190,6 +194,15 @@ class GitNudge:
                 ):
                     self.apply_resolution(resolution)
                     conflicts_resolved += 1
+                    applied_resolutions.append({
+                        "file": str(conflict_path),
+                        "confidence": resolution.confidence,
+                        "summary": resolution.changes_summary or "",
+                    })
+                    log.info(
+                        "auto-resolved %s (confidence=%s)",
+                        conflict_path, resolution.confidence,
+                    )
                 else:
                     reason = "low-confidence resolution"
                     if resolution and _has_conflict_markers(resolution.resolved_content):
@@ -210,6 +223,7 @@ class GitNudge:
                     ],
                     safety_sha=safety_sha,
                     warnings=warnings,
+                    applied_resolutions=applied_resolutions,
                 )
 
             if self.git.get_conflicted_files():
@@ -228,6 +242,7 @@ class GitNudge:
             message=message,
             safety_sha=safety_sha,
             warnings=warnings,
+            applied_resolutions=applied_resolutions,
         )
 
     def resolve_conflict(
@@ -307,18 +322,27 @@ class GitNudge:
 
         before_progress = self.git.get_rebase_progress()
         before_done = before_progress.current if before_progress else 0
+        before_total = before_progress.total if before_progress else 0
 
         success = self.git.continue_rebase()
 
         after_progress = self.git.get_rebase_progress()
-        after_done = after_progress.current if after_progress else 0
-        total = after_progress.total if after_progress else (
-            before_progress.total if before_progress else 0
-        )
-        remaining = max(total - after_done, 0)
-        applied = max(after_done - before_done, 1) if success else max(after_done - before_done, 0)
+        rebase_complete = success and self.git.get_rebase_state() == RebaseState.NONE
 
-        if success and self.git.get_rebase_state() == RebaseState.NONE:
+        if rebase_complete:
+            applied = max(before_total - before_done, 1)
+            remaining = 0
+        else:
+            after_done = after_progress.current if after_progress else 0
+            total = after_progress.total if after_progress else before_total
+            remaining = max(total - after_done, 0)
+            applied = (
+                max(after_done - before_done, 1)
+                if success
+                else max(after_done - before_done, 0)
+            )
+
+        if rebase_complete:
             self._clear_snapshot()
             return RebaseResult(
                 success=True,
@@ -387,7 +411,7 @@ class GitNudge:
             )
         if success:
             progress = self.git.get_rebase_progress()
-            remaining = (progress.total - progress.current) if progress else 0
+            remaining = max(progress.total - progress.current + 1, 0) if progress else 0
             return RebaseResult(
                 success=True,
                 commits_applied=0,
@@ -443,18 +467,40 @@ class GitNudge:
         return self.git._git_dir() / self.SNAPSHOT_NAME
 
     def _save_snapshot(self, target: str, head: str) -> None:
+        """Atomically write the pre-rebase recovery snapshot."""
+        path = self._snapshot_path()
         try:
-            self._snapshot_path().write_text(
-                json.dumps(
-                    {
-                        "head": head,
-                        "target": target,
-                        "branch": self.git.get_current_branch(),
-                        "timestamp": int(time.time()),
-                    },
-                    indent=2,
-                )
+            payload = json.dumps(
+                {
+                    "head": head,
+                    "target": target,
+                    "branch": self.git.get_current_branch(),
+                    "timestamp": int(time.time()),
+                },
+                indent=2,
             )
+        except (TypeError, ValueError) as e:
+            log.warning("Could not serialize safety snapshot: %s", e)
+            return
+
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp_path = tempfile.mkstemp(
+                prefix=".gitnudge-snapshot.",
+                suffix=".tmp",
+                dir=str(path.parent),
+            )
+            try:
+                with os.fdopen(fd, "w") as f:
+                    f.write(payload)
+                os.replace(tmp_path, path)
+                log.debug("snapshot written atomically to %s", path)
+            except Exception:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+                raise
         except OSError as e:
             log.warning("Could not save safety snapshot: %s", e)
 
