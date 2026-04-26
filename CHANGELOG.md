@@ -5,6 +5,79 @@ All notable changes to GitNudge are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-04-26
+
+Hardening release. Still Beta — CLI surface and config schema may change
+before 1.0.0. See the v1.0 tracking issue for remaining blockers.
+
+### Added
+- **`gitnudge explain [file]`** command — asks Claude for a plain-language
+  explanation of a conflict without proposing a resolution.
+- **Global `--verbose` / `-v` and `--quiet` / `-q` flags** on the root CLI,
+  wired into `config.ui.verbosity`. `--verbose` and `--quiet` are mutually
+  exclusive and exit with code 2.
+- **`python -m gitnudge`** entry point (`gitnudge/__main__.py`) mirroring the
+  `gitnudge` console script.
+- **`RebaseResult.applied_resolutions`** — during `--auto` rebases, each AI
+  auto-applied resolution is recorded with its file, confidence, and change
+  summary. `gitnudge rebase --auto` now prints this list so the user can see
+  what Claude actually changed.
+
+### Changed
+- **Single-sourced version**: `gitnudge.__version__` is now derived from
+  installed package metadata via `importlib.metadata`, eliminating drift
+  between `pyproject.toml` and `__init__.py`.
+- **`continue_rebase` applied-commit count is now accurate when the rebase
+  finishes in the same call**. Previously the count collapsed to `1` because
+  the post-continue progress file had been removed. It now uses the pre-call
+  `total - done` when completion is detected.
+- **Stricter ref validator** (`_is_safe_ref`): now rejects `..`, `//`, `@{`,
+  leading `:` or `/`, and `.lock` / trailing-`.` / trailing-`/` suffixes on
+  top of the prior flag-injection and whitespace rules. Common refs
+  (`HEAD`, `HEAD~5`, `origin/main`, `v0.3.0`, SHAs, etc.) continue to pass.
+- **Safety snapshot write is now atomic** (`tempfile` + `os.replace`),
+  matching `Config.save`. A crash or OS error mid-write leaves no partial
+  `.git/gitnudge-snapshot.json` behind.
+- **Log redaction filter** now also scrubs secrets out of `record.args`, not
+  just the rendered message, and no longer silently passes through records
+  whose args don't match the format string.
+- `--ai-verify` help text on `gitnudge continue` corrected to "Refuse to
+  continue if any staged file still contains conflict markers" (was the
+  misleading "Verify resolution with AI first").
+- `GitNudge.analyze` no longer accepts the unused `detailed=` kwarg.
+- `AIAssistant.analyze_conflict` now reads `conflict.full_content` once
+  instead of re-reading the file via the property.
+- Internal: repeated `if ctx.obj.get("no_color")` blocks in each CLI command
+  consolidated into a single `_apply_cli_overrides` helper.
+
+### Fixed
+- `gitnudge continue` message no longer reports "applied 1 more commits" when
+  2+ commits were applied in the final continuation.
+- `gitnudge skip` "N remaining" was off-by-one — it did not count the new
+  current commit. Now reports the correct count including the commit about
+  to be applied.
+- **`AIAssistant._extract_section` header match is now line-anchored.**
+  Previously a lowercase `"explanation:"` appearing in the model's prose
+  could be matched before the real `EXPLANATION:` header, causing the
+  wrong text to be parsed into the section body.
+- **`SHOULD_PROCEED` parsing** now accepts natural phrasings like
+  `"Yes, with caveats"` and `"No."` (was only literal `yes`/`true`/`proceed`).
+- **`_is_safe_ref` now rejects trailing `/`** (e.g. `foo/` — git rejects these
+  too). Valid refs like `refs/heads/main` still pass.
+- **`confidence` and `risk_level` normalizers** strip trailing punctuation
+  so `"high."` / `" HIGH!!"` / `"medium,"` all round-trip to the canonical
+  value instead of silently defaulting to `medium`.
+- **`gitnudge resolve <file>` and `gitnudge explain <file>`** now verify the
+  requested file is in the current conflicted set before invoking the AI,
+  instead of silently sending an empty index payload to Claude.
+- **`ConflictFile.full_content`** now logs a warning when the on-disk file
+  cannot be read, instead of silently returning `""`.
+
+### Security
+- `gitnudge config --set-key` now prints a visible note that the key is
+  stored in plaintext (chmod 0600) and recommends `ANTHROPIC_API_KEY` for
+  shared machines.
+
 ## [0.2.0] - 2026-04-18
 
 ### Added
@@ -63,5 +136,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Lazy-loaded `AIAssistant` so commands not requiring the API never instantiate the client.
 - Test suite (82 tests) and CI on GitHub Actions (lint + test).
 
+[0.3.0]: https://github.com/GitNudge/gitnudge/releases/tag/v0.3.0
 [0.2.0]: https://github.com/GitNudge/gitnudge/releases/tag/v0.2.0
 [0.1.0]: https://github.com/GitNudge/gitnudge/releases/tag/v0.1.0
