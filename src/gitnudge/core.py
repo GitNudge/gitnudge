@@ -229,7 +229,10 @@ class GitNudge:
             if self.git.get_conflicted_files():
                 continue
 
-            self.git.continue_rebase()
+            if not self.git.continue_rebase() and not self.git.get_conflicted_files():
+                warnings.append("git rebase --continue failed without new conflicts")
+                log.warning(warnings[-1])
+                break
 
         message = (
             f"Rebased {commits_to_apply} commits with "
