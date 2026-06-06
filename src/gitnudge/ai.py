@@ -237,12 +237,12 @@ Keep your explanation concise and actionable."""
                 messages=[{"role": "user", "content": prompt}],
             )
 
-            if response.content and len(response.content) > 0:
-                first_block = response.content[0]
-                if hasattr(first_block, "text"):
-                    text = getattr(first_block, "text", "")
-                    return str(text)
-            return ""
+            parts = [
+                str(getattr(block, "text", ""))
+                for block in (response.content or [])
+                if hasattr(block, "text")
+            ]
+            return "".join(parts)
 
         except anthropic.APIError as e:
             log.error("Claude API call failed: %s", redact_secrets(e))

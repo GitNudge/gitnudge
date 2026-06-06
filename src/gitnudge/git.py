@@ -232,7 +232,8 @@ class Git:
                 sha = ""
                 msg_file = base / "message"
                 if msg_file.exists():
-                    subject = msg_file.read_text().splitlines()[0] if msg_file.read_text() else ""
+                    msg_text = msg_file.read_text()
+                    subject = msg_text.splitlines()[0] if msg_text else ""
                 head_name = base / "stopped-sha"
                 if head_name.exists():
                     sha = head_name.read_text().strip()

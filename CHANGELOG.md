@@ -5,6 +5,22 @@ All notable changes to GitNudge are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] - 2026-06-06
+
+Bug-fix release. No API or config changes.
+
+### Fixed
+- **`AIAssistant._call_api` now reads all text blocks** instead of only
+  `response.content[0]`. Responses whose first block is non-text (e.g. a
+  thinking block) no longer come back empty.
+- **`--auto` rebase loop now checks `git rebase --continue`'s result.** If a
+  continue fails without producing new conflicts, it records a warning and
+  stops instead of looping until the iteration cap and reporting false success.
+- **`Git.get_rebase_progress`** reads the rebase `message` file once instead of
+  three times.
+- **Landing-page worker** now returns a real `404` for unknown paths instead of
+  serving the homepage with `200`; the homepage is served only for `/`.
+
 ## [0.3.0] - 2026-04-26
 
 Hardening release. Still Beta — CLI surface and config schema may change
@@ -136,6 +152,7 @@ before 1.0.0. See the v1.0 tracking issue for remaining blockers.
 - Lazy-loaded `AIAssistant` so commands not requiring the API never instantiate the client.
 - Test suite (82 tests) and CI on GitHub Actions (lint + test).
 
+[0.3.1]: https://github.com/GitNudge/gitnudge/releases/tag/v0.3.1
 [0.3.0]: https://github.com/GitNudge/gitnudge/releases/tag/v0.3.0
 [0.2.0]: https://github.com/GitNudge/gitnudge/releases/tag/v0.2.0
 [0.1.0]: https://github.com/GitNudge/gitnudge/releases/tag/v0.1.0
