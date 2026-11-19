@@ -4,7 +4,7 @@
 
 [![Lint](https://github.com/GitNudge/gitnudge/actions/workflows/lint.yml/badge.svg)](https://github.com/GitNudge/gitnudge/actions/workflows/lint.yml)
 [![Test](https://github.com/GitNudge/gitnudge/actions/workflows/test.yml/badge.svg)](https://github.com/GitNudge/gitnudge/actions/workflows/test.yml)
-[![Version](https://img.shields.io/badge/version-0.4.0-blue.svg)](https://github.com/GitNudge/gitnudge/releases)
+[![Version](https://img.shields.io/badge/version-0.4.1-blue.svg)](https://github.com/GitNudge/gitnudge/releases)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://www.python.org/downloads/)
 
@@ -32,7 +32,7 @@ GitNudge is an open-source CLI tool that helps you perform git rebases with the 
 pip install git+https://github.com/GitNudge/gitnudge.git
 
 # Install a specific tag/release
-pip install git+https://github.com/GitNudge/gitnudge.git@v0.4.0
+pip install git+https://github.com/GitNudge/gitnudge.git@v0.4.1
 ```
 
 ### From source

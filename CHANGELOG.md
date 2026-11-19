@@ -5,6 +5,22 @@ All notable changes to GitNudge are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.1] - 2026-11-19
+
+CI-only release. No code, API, or config changes.
+
+### Fixed
+- **Test pipeline failed on Python 3.9.** GitHub's `ubuntu-latest` runner moved
+  to Ubuntu 26.04, which has no Python 3.9 build, so the `ubuntu-latest / 3.9`
+  job failed at `setup-python` before any test ran. The 3.9 job now runs on
+  `ubuntu-24.04`; all other jobs stay on `ubuntu-latest` / `macos-latest`
+  (same 8-job matrix).
+
+### Changed
+- The version test now checks that `pyproject.toml`, the top CHANGELOG entry,
+  and the README version badge / install tag agree, instead of a hardcoded
+  version number.
+
 ## [0.4.0] - 2026-11-19
 
 Safety and correctness release from a full code review. Fixes are covered by

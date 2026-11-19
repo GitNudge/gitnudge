@@ -2684,15 +2684,21 @@ class TestReviewFixesLow:
         assert result.exit_code == 0
         assert rebase.call_args.kwargs["auto_resolve"] is True
 
-    def test_project_version_is_0_4_0(self):
+    def test_version_consistent_across_project_files(self):
+        import re
         import sys
         if sys.version_info >= (3, 11):
             import tomllib
         else:
             import tomli as tomllib
         root = Path(__file__).resolve().parent.parent
-        data = tomllib.loads((root / "pyproject.toml").read_text())
-        assert data["project"]["version"] == "0.4.0"
+        version = tomllib.loads((root / "pyproject.toml").read_text())["project"]["version"]
+        changelog = (root / "CHANGELOG.md").read_text()
+        top = re.search(r"^## \[(\d+\.\d+\.\d+)\]", changelog, re.M)
+        assert top is not None and top.group(1) == version
+        readme = (root / "README.md").read_text()
+        assert f"version-{version}-blue.svg" in readme
+        assert f"gitnudge.git@v{version}" in readme
 
 
 class TestFinalReviewFixes:
