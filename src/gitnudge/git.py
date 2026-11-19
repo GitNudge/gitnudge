@@ -17,6 +17,14 @@ _REF_RE = re.compile(r"^[A-Za-z0-9_./\-@~^{}:+]+$")
 
 _REF_FORBIDDEN_SUBSTRINGS = ("..", "//", "@{", "\\")
 
+_LOG_SEP = "\x1f"
+
+
+def _split_paths(output: str) -> list[str]:
+    """Split git path output (NUL-separated with -z, else newline-separated)."""
+    parts = output.split("\0") if "\0" in output else output.splitlines()
+    return [p.strip("\r\n") for p in parts if p.strip("\r\n")]
+
 
 def _is_safe_ref(ref: str) -> bool:
     """Conservative ref/branch/rev-spec validator.
@@ -59,14 +67,18 @@ class ConflictFile:
     theirs_content: str
     base_content: str
     conflict_markers: list[tuple[int, int]]
+    is_binary: bool = False
 
     @property
     def full_content(self) -> str:
         """Get the full file content with conflict markers."""
         try:
-            return self.path.read_text()
+            return self.path.read_text(encoding="utf-8")
         except OSError as e:
             log.warning("Could not read conflict file %s: %s", self.path, e)
+            return ""
+        except UnicodeDecodeError as e:
+            log.warning("Conflict file %s is not valid UTF-8: %s", self.path, e)
             return ""
 
 
@@ -104,6 +116,12 @@ class RebaseProgress:
     total: int
     current_subject: str
     current_sha: str
+    current_applied: bool = False
+
+    @property
+    def applied_count(self) -> int:
+        """Number of commits fully applied so far."""
+        return self.current if self.current_applied else max(self.current - 1, 0)
 
 
 class GitError(Exception):
@@ -117,14 +135,21 @@ class Git:
     def __init__(self, repo_path: Path | None = None):
         """Initialize Git wrapper."""
         self.repo_path = (repo_path or Path.cwd()).resolve()
+        self.last_error = ""
         self._verify_repo()
 
     def _verify_repo(self) -> None:
-        """Verify that we're in a git repository."""
+        """Verify that we're in a git repository and anchor at its top level."""
         try:
             self._run(["rev-parse", "--git-dir"])
         except GitError as e:
             raise GitError(f"Not a git repository: {self.repo_path}") from e
+
+        top = self._run(["rev-parse", "--show-toplevel"], check=False)
+        top_path = top.stdout.strip() if top.returncode == 0 else ""
+        if top_path:
+            self.repo_path = Path(top_path).resolve()
+            log.debug("repo top level: %s", self.repo_path)
 
     def _run(
         self,
@@ -133,7 +158,7 @@ class Git:
         capture_output: bool = True,
     ) -> subprocess.CompletedProcess[str]:
         """Run a git command."""
-        cmd = ["git", "-C", str(self.repo_path), *args]
+        cmd = ["git", "-C", str(self.repo_path), "-c", "core.quotePath=false", *args]
         log.debug("git exec: %s", " ".join(cmd))
 
         try:
@@ -141,7 +166,8 @@ class Git:
                 cmd,
                 check=check,
                 capture_output=capture_output,
-                text=True,
+                encoding="utf-8",
+                errors="replace",
             )
             return result
         except subprocess.CalledProcessError as e:
@@ -200,10 +226,18 @@ class Git:
         )
         return [ln for ln in result.stdout.splitlines() if ln.strip()]
 
-    def is_binary_path(self, path: str) -> bool:
-        """Return True if path is a binary file in the index/HEAD."""
+    def is_binary_path(
+        self, path: str, base: str | None = None, target: str | None = None
+    ) -> bool:
+        """Return True if path is binary in the base..target range (default: HEAD vs tree)."""
+        if base and target:
+            if not _is_safe_ref(base) or not _is_safe_ref(target):
+                raise GitError(f"Invalid git reference: {base!r} or {target!r}")
+            rev_args = [base, target]
+        else:
+            rev_args = ["HEAD"]
         result = self._run(
-            ["diff", "--numstat", "HEAD", "--", path], check=False
+            ["diff", "--numstat", *rev_args, "--", path], check=False
         )
         for line in result.stdout.splitlines():
             parts = line.split("\t", 2)
@@ -232,7 +266,7 @@ class Git:
                 sha = ""
                 msg_file = base / "message"
                 if msg_file.exists():
-                    msg_text = msg_file.read_text()
+                    msg_text = msg_file.read_text(encoding="utf-8", errors="replace")
                     subject = msg_text.splitlines()[0] if msg_text else ""
                 head_name = base / "stopped-sha"
                 if head_name.exists():
@@ -243,6 +277,7 @@ class Git:
                     total=total,
                     current_subject=subject,
                     current_sha=sha,
+                    current_applied=(base / "amend").exists(),
                 )
             except (OSError, ValueError) as e:
                 log.debug("Could not parse rebase progress: %s", e)
@@ -262,23 +297,23 @@ class Git:
 
     def get_conflicted_files(self) -> list[Path]:
         """Get list of files with unresolved conflicts as repo-relative paths."""
-        result = self._run(["diff", "--name-only", "--diff-filter=U"], check=False)
+        result = self._run(["diff", "--name-only", "--diff-filter=U", "-z"], check=False)
         if result.returncode != 0:
             return []
 
-        files: list[Path] = []
-        for line in result.stdout.splitlines():
-            line = line.strip()
-            if line:
-                files.append(self.repo_path / line)
-        return files
+        return [self.repo_path / name for name in _split_paths(result.stdout)]
+
+    def get_staged_files(self) -> list[str]:
+        """Get repo-relative paths of staged files."""
+        result = self._run(["diff", "--cached", "--name-only", "-z"], check=False)
+        return _split_paths(result.stdout)
 
     def _to_repo_relative(self, file_path: Path) -> str:
         """Convert a path to a repo-relative string (POSIX-style)."""
         p = Path(file_path)
         if p.is_absolute():
             try:
-                rel = p.resolve().relative_to(self.repo_path)
+                rel = (p.parent.resolve() / p.name).relative_to(self.repo_path)
             except ValueError as e:
                 raise GitError(
                     f"Path {file_path} is outside repository {self.repo_path}"
@@ -294,19 +329,30 @@ class Git:
         theirs = self._run(["show", f":3:{rel}"], check=False).stdout
         base = self._run(["show", f":1:{rel}"], check=False).stdout
 
-        conflict_markers = []
-        try:
-            content = file_path.read_text()
-            lines = content.split("\n")
-            start = None
-            for i, line in enumerate(lines):
-                if line.startswith("<<<<<<<"):
-                    start = i
-                elif line.startswith(">>>>>>>") and start is not None:
-                    conflict_markers.append((start, i))
-                    start = None
-        except OSError as e:
-            log.warning("Could not read conflict markers from %s: %s", file_path, e)
+        conflict_markers: list[tuple[int, int]] = []
+        is_binary = False
+        if file_path.is_symlink():
+            log.info("Conflict path %s is a symlink; manual resolution required", file_path)
+            is_binary = True
+        else:
+            try:
+                raw = file_path.read_bytes()
+                if b"\0" in raw[:8000]:
+                    is_binary = True
+                try:
+                    content = raw.decode("utf-8")
+                except UnicodeDecodeError:
+                    is_binary = True
+                    content = ""
+                start = None
+                for i, line in enumerate(content.split("\n")):
+                    if line.startswith("<<<<<<<"):
+                        start = i
+                    elif line.startswith(">>>>>>>") and start is not None:
+                        conflict_markers.append((start, i))
+                        start = None
+            except OSError as e:
+                log.warning("Could not read conflict markers from %s: %s", file_path, e)
 
         return ConflictFile(
             path=file_path,
@@ -314,6 +360,7 @@ class Git:
             theirs_content=theirs,
             base_content=base,
             conflict_markers=conflict_markers,
+            is_binary=is_binary,
         )
 
     def get_commits_between(self, base: str, head: str = "HEAD") -> list[Commit]:
@@ -326,9 +373,10 @@ class Git:
             return []
         merge_base = merge_base_result.stdout.strip()
 
-        format_str = "%H|%h|%s|%an|%ai"
+        format_str = _LOG_SEP.join(("%H", "%h", "%s", "%an", "%ai"))
         result = self._run([
             "log",
+            "--no-merges",
             "--format=" + format_str,
             f"{merge_base}..{head}",
         ])
@@ -337,7 +385,7 @@ class Git:
         for line in result.stdout.strip().split("\n"):
             if not line:
                 continue
-            parts = line.split("|", 4)
+            parts = line.split(_LOG_SEP, 4)
             if len(parts) >= 5:
                 sha, short_sha, message, author, date = parts
 
@@ -391,10 +439,10 @@ class Git:
         merge_base = merge_base_result.stdout.strip()
 
         head_sha = self.get_head_sha()
-        target_sha_result = self._run(["rev-parse", target], check=False)
+        target_sha_result = self._run(["rev-parse", f"{target}^{{commit}}"], check=False)
         target_sha = target_sha_result.stdout.strip() if target_sha_result.returncode == 0 else ""
 
-        is_up_to_date = bool(target_sha) and merge_base == head_sha
+        is_up_to_date = bool(target_sha) and merge_base == target_sha
         is_fast_forward = bool(target_sha) and merge_base == head_sha and target_sha != head_sha
 
         commits = self.get_commits_between(target)
@@ -413,7 +461,7 @@ class Git:
             overlapping = set(commit.files_changed) & target_files
             for file in overlapping:
                 if file not in binary_cache:
-                    binary_cache[file] = self.is_binary_path(file)
+                    binary_cache[file] = self.is_binary_path(file, merge_base, target)
                 if binary_cache[file]:
                     continue
                 potential_conflicts.append({
@@ -444,19 +492,31 @@ class Git:
         args.append("--")
         args.append(target)
 
-        result = self._run(args, check=False)
-        return result.returncode == 0
+        result = self._run(args, check=False, capture_output=not interactive)
+        return self._record_result(result)
+
+    def _record_result(self, result: subprocess.CompletedProcess[str]) -> bool:
+        """Store git's error output for failed commands and return success."""
+        ok = result.returncode == 0
+        if ok:
+            self.last_error = ""
+        else:
+            err = result.stderr if isinstance(result.stderr, str) else ""
+            out = result.stdout if isinstance(result.stdout, str) else ""
+            self.last_error = (err or out or "").strip()
+            log.debug("git failed: %s", self.last_error)
+        return ok
 
     def continue_rebase(self) -> bool:
         """Continue a rebase after resolving conflicts."""
         env = {"GIT_EDITOR": "true"}
         result = self._run_with_env(["rebase", "--continue"], env, check=False)
-        return result.returncode == 0
+        return self._record_result(result)
 
     def skip_rebase(self) -> bool:
         """Skip the current commit during a rebase."""
         result = self._run(["rebase", "--skip"], check=False)
-        return result.returncode == 0
+        return self._record_result(result)
 
     def abort_rebase(self) -> None:
         """Abort the current rebase operation."""
@@ -470,12 +530,17 @@ class Git:
     ) -> subprocess.CompletedProcess[str]:
         """Run a git command with extra env vars merged into the parent env."""
         import os
-        cmd = ["git", "-C", str(self.repo_path), *args]
+        cmd = ["git", "-C", str(self.repo_path), "-c", "core.quotePath=false", *args]
         merged = {**os.environ, **env}
         log.debug("git exec (env=%s): %s", list(env.keys()), " ".join(cmd))
         try:
             return subprocess.run(
-                cmd, check=check, capture_output=True, text=True, env=merged
+                cmd,
+                check=check,
+                capture_output=True,
+                encoding="utf-8",
+                errors="replace",
+                env=merged,
             )
         except subprocess.CalledProcessError as e:
             raise GitError(

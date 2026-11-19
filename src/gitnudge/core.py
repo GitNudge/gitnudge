@@ -10,7 +10,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from gitnudge.ai import AIAssistant, ConflictResolution, RebaseRecommendation
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
+
+from gitnudge.ai import AIAssistant, AIError, ConflictResolution, RebaseRecommendation
 from gitnudge.config import Config
 from gitnudge.git import Git, RebaseState
 from gitnudge.logging_utils import get_logger
@@ -35,6 +37,17 @@ class RebaseResult:
     safety_sha: str | None = None
     warnings: list[str] = field(default_factory=list)
     applied_resolutions: list[dict[str, str]] = field(default_factory=list)
+
+
+class Snapshot(BaseModel):
+    """Validated pre-rebase recovery snapshot."""
+
+    model_config = ConfigDict(extra="ignore", strict=True)
+
+    head: str = Field(pattern=r"^[0-9a-fA-F]{4,64}$")
+    target: str = Field(default="", max_length=1024)
+    branch: str = Field(default="", max_length=1024)
+    timestamp: int = Field(default=0, ge=0)
 
 
 def _has_conflict_markers(text: str) -> bool:
@@ -112,6 +125,11 @@ class GitNudge:
             errors = self.preflight(target)
             if errors:
                 raise GitNudgeError("; ".join(errors))
+        elif force and not dry_run and self.git.get_rebase_state() != RebaseState.NONE:
+            raise GitNudgeError(
+                "Rebase already in progress; --force cannot start another one. "
+                "Use 'gitnudge continue', 'gitnudge skip', or 'gitnudge abort'."
+            )
 
         analysis = self.analyze(target)
         commits_to_apply = len(analysis.commits_to_rebase)
@@ -123,14 +141,14 @@ class GitNudge:
                 "Refusing to rebase unrelated histories."
             )
 
-        if analysis.is_up_to_date and commits_to_apply == 0:
+        if analysis.is_up_to_date and not interactive:
             return RebaseResult(
                 success=True,
                 commits_applied=0,
                 conflicts_resolved=0,
                 message=(
                     f"Already up to date with {target} "
-                    "(branch is fully contained in target)."
+                    "(target is already in branch history)."
                 ),
             )
 
@@ -150,11 +168,26 @@ class GitNudge:
         success = self.git.start_rebase(target, interactive)
 
         if success:
+            if self.git.get_rebase_state() != RebaseState.NONE:
+                return RebaseResult(
+                    success=True,
+                    commits_applied=0,
+                    conflicts_resolved=0,
+                    message=(
+                        "Rebase paused (still in progress). "
+                        "Run 'gitnudge continue' when ready."
+                    ),
+                    safety_sha=safety_sha,
+                )
+            if analysis.is_fast_forward and commits_to_apply == 0:
+                message = f"Fast-forwarded to {target}"
+            else:
+                message = f"Successfully rebased {commits_to_apply} commits onto {target}"
             return RebaseResult(
                 success=True,
                 commits_applied=commits_to_apply,
                 conflicts_resolved=0,
-                message=f"Successfully rebased {commits_to_apply} commits onto {target}",
+                message=message,
                 safety_sha=safety_sha,
             )
 
@@ -162,12 +195,28 @@ class GitNudge:
         applied_resolutions: list[dict[str, str]] = []
         max_iterations = max(commits_to_apply * 3, 20)
         iterations = 0
+        loop_failed = False
 
-        while self.git.get_rebase_state() == RebaseState.CONFLICT:
+        state = self.git.get_rebase_state()
+        if state != RebaseState.CONFLICT:
+            git_error = self.git.last_error or "unknown error"
+            log.error("git rebase failed without conflicts: %s", git_error)
+            if state == RebaseState.NONE:
+                self._clear_snapshot()
+            return RebaseResult(
+                success=False,
+                commits_applied=0,
+                conflicts_resolved=0,
+                message=f"git rebase failed: {git_error}",
+                safety_sha=safety_sha if state != RebaseState.NONE else None,
+            )
+
+        while state == RebaseState.CONFLICT:
             iterations += 1
             if iterations > max_iterations:
                 warnings.append(f"rebase loop hit max iterations ({max_iterations})")
                 log.warning(warnings[-1])
+                loop_failed = True
                 break
 
             conflicted_files = self.git.get_conflicted_files()
@@ -186,7 +235,12 @@ class GitNudge:
 
             stop = False
             for conflict_path in conflicted_files:
-                resolution = self.resolve_conflict(conflict_path)
+                try:
+                    resolution = self.resolve_conflict(conflict_path)
+                except (GitNudgeError, AIError) as e:
+                    warnings.append(f"{conflict_path}: {e}")
+                    stop = True
+                    break
                 if (
                     resolution
                     and resolution.confidence in ("high", "medium")
@@ -227,12 +281,35 @@ class GitNudge:
                 )
 
             if self.git.get_conflicted_files():
+                state = self.git.get_rebase_state()
                 continue
 
             if not self.git.continue_rebase() and not self.git.get_conflicted_files():
-                warnings.append("git rebase --continue failed without new conflicts")
+                detail = f": {self.git.last_error}" if self.git.last_error else ""
+                warnings.append(f"git rebase --continue failed without new conflicts{detail}")
                 log.warning(warnings[-1])
+                loop_failed = True
                 break
+
+            state = self.git.get_rebase_state()
+
+        if loop_failed or state != RebaseState.NONE:
+            return RebaseResult(
+                success=False,
+                commits_applied=0,
+                conflicts_resolved=conflicts_resolved,
+                message=(
+                    "Rebase did not complete; still in progress. "
+                    "Check 'gitnudge status' and resolve manually."
+                ),
+                conflicts=[
+                    self.git.get_conflict_details(p)
+                    for p in self.git.get_conflicted_files()
+                ],
+                safety_sha=safety_sha,
+                warnings=warnings,
+                applied_resolutions=applied_resolutions,
+            )
 
         message = (
             f"Rebased {commits_to_apply} commits with "
@@ -261,7 +338,17 @@ class GitNudge:
             file_path = conflicted[0]
 
         conflict = self.git.get_conflict_details(file_path)
+        self._require_text(conflict)
         return self.ai.analyze_conflict(conflict, context)
+
+    @staticmethod
+    def _require_text(conflict: ConflictFile) -> None:
+        """Reject binary / non-UTF-8 conflicts that AI cannot resolve safely."""
+        if conflict.is_binary:
+            raise GitNudgeError(
+                f"{conflict.path} is binary, a symlink, or not UTF-8; resolve it manually "
+                "(e.g. 'git checkout --ours/--theirs -- <file>')."
+            )
 
     def explain_conflict(self, file_path: Path | None = None) -> str:
         """Get a plain-language explanation of a conflict."""
@@ -272,6 +359,7 @@ class GitNudge:
             file_path = conflicted[0]
 
         conflict = self.git.get_conflict_details(file_path)
+        self._require_text(conflict)
         return self.ai.explain_conflict(conflict)
 
     def apply_resolution(self, resolution: ConflictResolution) -> None:
@@ -286,7 +374,7 @@ class GitNudge:
         target = self._resolve_inside_repo(file_path)
 
         try:
-            target.write_text(resolution.resolved_content)
+            target.write_text(resolution.resolved_content, encoding="utf-8")
         except OSError as e:
             log.error("Failed to write resolution for %s: %s", target, e)
             raise GitNudgeError(f"Failed to write {target}: {e}") from e
@@ -298,6 +386,8 @@ class GitNudge:
         """Resolve and validate file_path is inside the repo."""
         repo = self.git.repo_path.resolve()
         candidate = file_path if file_path.is_absolute() else repo / file_path
+        if candidate.is_symlink():
+            raise GitNudgeError(f"Refusing to write through symlink: {file_path}")
         try:
             resolved = candidate.resolve()
             resolved.relative_to(repo)
@@ -324,7 +414,7 @@ class GitNudge:
             warnings.extend(self._ai_verify_staged_resolutions())
 
         before_progress = self.git.get_rebase_progress()
-        before_done = before_progress.current if before_progress else 0
+        before_done = before_progress.applied_count if before_progress else 0
         before_total = before_progress.total if before_progress else 0
 
         success = self.git.continue_rebase()
@@ -336,7 +426,7 @@ class GitNudge:
             applied = max(before_total - before_done, 1)
             remaining = 0
         else:
-            after_done = after_progress.current if after_progress else 0
+            after_done = after_progress.applied_count if after_progress else 0
             total = after_progress.total if after_progress else before_total
             remaining = max(total - after_done, 0)
             applied = (
@@ -346,7 +436,6 @@ class GitNudge:
             )
 
         if rebase_complete:
-            self._clear_snapshot()
             return RebaseResult(
                 success=True,
                 commits_applied=applied,
@@ -368,11 +457,16 @@ class GitNudge:
             )
 
         new_conflicts = self.git.get_conflicted_files()
+        if new_conflicts:
+            message = f"New conflicts encountered ({remaining} commits remaining)"
+        else:
+            message = f"git rebase --continue failed: {self.git.last_error or 'unknown error'}"
+            log.error(message)
         return RebaseResult(
             success=False,
             commits_applied=applied,
             conflicts_resolved=0,
-            message=f"New conflicts encountered ({remaining} commits remaining)",
+            message=message,
             conflicts=[self.git.get_conflict_details(p) for p in new_conflicts],
             warnings=warnings,
         )
@@ -380,14 +474,10 @@ class GitNudge:
     def _ai_verify_staged_resolutions(self) -> list[str]:
         """Verify currently-staged files don't still have conflict markers."""
         warnings: list[str] = []
-        result = self.git._run(["diff", "--cached", "--name-only"], check=False)
-        for line in result.stdout.splitlines():
-            line = line.strip()
-            if not line:
-                continue
+        for line in self.git.get_staged_files():
             try:
-                content = (self.git.repo_path / line).read_text()
-            except OSError:
+                content = (self.git.repo_path / line).read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
                 continue
             if _has_conflict_markers(content):
                 warnings.append(f"{line}: still contains conflict markers")
@@ -405,7 +495,6 @@ class GitNudge:
 
         success = self.git.skip_rebase()
         if success and self.git.get_rebase_state() == RebaseState.NONE:
-            self._clear_snapshot()
             return RebaseResult(
                 success=True,
                 commits_applied=0,
@@ -414,7 +503,7 @@ class GitNudge:
             )
         if success:
             progress = self.git.get_rebase_progress()
-            remaining = max(progress.total - progress.current + 1, 0) if progress else 0
+            remaining = max(progress.total - progress.applied_count, 0) if progress else 0
             return RebaseResult(
                 success=True,
                 commits_applied=0,
@@ -423,11 +512,16 @@ class GitNudge:
             )
 
         new_conflicts = self.git.get_conflicted_files()
+        if new_conflicts:
+            message = "Skip produced new conflicts"
+        else:
+            message = f"git rebase --skip failed: {self.git.last_error or 'unknown error'}"
+            log.error(message)
         return RebaseResult(
             success=False,
             commits_applied=0,
             conflicts_resolved=0,
-            message="Skip produced new conflicts",
+            message=message,
             conflicts=[self.git.get_conflict_details(p) for p in new_conflicts],
         )
 
@@ -463,7 +557,9 @@ class GitNudge:
                 if progress
                 else None
             ),
-            "safety_sha": snapshot.get("head") if snapshot else None,
+            "safety_sha": (
+                snapshot.get("head") if snapshot and state != RebaseState.NONE else None
+            ),
         }
 
     def _snapshot_path(self) -> Path:
@@ -473,15 +569,13 @@ class GitNudge:
         """Atomically write the pre-rebase recovery snapshot."""
         path = self._snapshot_path()
         try:
-            payload = json.dumps(
-                {
-                    "head": head,
-                    "target": target,
-                    "branch": self.git.get_current_branch(),
-                    "timestamp": int(time.time()),
-                },
-                indent=2,
+            snapshot = Snapshot(
+                head=head,
+                target=target,
+                branch=self.git.get_current_branch(),
+                timestamp=int(time.time()),
             )
+            payload = json.dumps(snapshot.model_dump(), indent=2)
         except (TypeError, ValueError) as e:
             log.warning("Could not serialize safety snapshot: %s", e)
             return
@@ -512,9 +606,17 @@ class GitNudge:
         if not path.exists():
             return None
         try:
-            return json.loads(path.read_text())
-        except (OSError, json.JSONDecodeError) as e:
-            log.warning("Could not read snapshot: %s", e)
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return Snapshot.model_validate(data).model_dump()
+        except ValidationError as e:
+            errors = e.errors()
+            loc = errors[0]["loc"] if errors else ()
+            msg = errors[0]["msg"] if errors else "invalid"
+            field_name = ".".join(str(x) for x in loc) or "snapshot"
+            log.warning("Ignoring invalid snapshot %s: %s: %s", path, field_name, msg)
+            return None
+        except (OSError, ValueError) as e:
+            log.warning("Ignoring invalid snapshot %s: %s", path, e)
             return None
 
     def _clear_snapshot(self) -> None:

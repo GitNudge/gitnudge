@@ -13,6 +13,18 @@ from gitnudge.core import GitNudge, GitNudgeError
 from gitnudge.git import Commit, ConflictFile, Git, GitError, RebaseAnalysis, RebaseState
 
 
+@pytest.fixture(autouse=True)
+def _isolate_user_config(tmp_path_factory, monkeypatch):
+    """Never let tests read or write the real user config or API key."""
+    import gitnudge.config as config_module
+    safe_dir = tmp_path_factory.mktemp("gitnudge-config")
+    monkeypatch.setattr(config_module, "CONFIG_DIR", safe_dir)
+    monkeypatch.setattr(config_module, "CONFIG_FILE", safe_dir / "config.toml")
+    monkeypatch.delenv("GITNUDGE_CONFIG", raising=False)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("GITNUDGE_MODEL", raising=False)
+
+
 class TestConfig:
     """Tests for configuration management."""
 
@@ -21,8 +33,8 @@ class TestConfig:
         config = Config()
 
         assert config.api.api_key == ""
-        assert config.api.model == "claude-sonnet-4-20250514"
-        assert config.api.max_tokens == 4096
+        assert config.api.model == "claude-sonnet-5-5"
+        assert config.api.max_tokens == 16000
         assert config.behavior.auto_stage is True
         assert config.behavior.show_previews is True
         assert config.behavior.max_context_lines == 500
@@ -75,7 +87,7 @@ class TestConfig:
         assert "behavior" in data
         assert "ui" in data
         assert data["api"]["api_key"] == "test-key"
-        assert data["api"]["model"] == "claude-sonnet-4-20250514"
+        assert data["api"]["model"] == "claude-sonnet-5-5"
         assert data["behavior"]["auto_stage"] is True
 
     def test_config_to_dict_no_api_key(self):
@@ -378,7 +390,7 @@ theirs code
         """Test getting commits between references."""
         mock_run.side_effect = [
             MagicMock(stdout="base123\n", returncode=0),
-            MagicMock(stdout="abc123|abc123|Message|Author|2024-01-01\n", returncode=0),
+            MagicMock(stdout="abc123\x1fabc123\x1fMessage\x1fAuthor\x1f2024-01-01\n", returncode=0),
             MagicMock(stdout="file1.py\nfile2.py\n", returncode=0),
         ]
 
@@ -429,7 +441,7 @@ theirs code
             MagicMock(stdout="head456\n", returncode=0),
             MagicMock(stdout="target789\n", returncode=0),
             MagicMock(stdout="base123\n", returncode=0),
-            MagicMock(stdout="abc123|abc123|Message|Author|2024-01-01\n", returncode=0),
+            MagicMock(stdout="abc123\x1fabc123\x1fMessage\x1fAuthor\x1f2024-01-01\n", returncode=0),
             MagicMock(stdout="file1.py\n", returncode=0),
             MagicMock(stdout="file1.py\nfile2.py\n", returncode=0),
             MagicMock(stdout="0\t0\tfile1.py\n", returncode=0),
@@ -1439,11 +1451,13 @@ def hello():
             "EXPLANATION:\nTest\n\nRESOLVED_CONTENT:\n```\ncode\n```\n\n"
             "CONFIDENCE: high\n\nCHANGES_SUMMARY:\nSummary"
         )
-        mock_response.content = [MagicMock(text=response_text)]
+        mock_response.content = [MagicMock(type="text", text=response_text)]
+        mock_response.stop_reason = "end_turn"
 
         with patch("anthropic.Anthropic") as mock_anthropic:
             mock_client = MagicMock()
-            mock_client.messages.create.return_value = mock_response
+            stream_ctx = mock_client.messages.stream.return_value.__enter__.return_value
+            stream_ctx.get_final_message.return_value = mock_response
             mock_anthropic.return_value = mock_client
 
             assistant = AIAssistant(config)
@@ -1451,6 +1465,8 @@ def hello():
 
         assert resolution is not None
         assert resolution.file_path == "test.py"
+        assert resolution.resolved_content == "code"
+        assert resolution.confidence == "high"
 
     def test_call_api_error(self):
         """Test API call error handling."""
@@ -1464,7 +1480,7 @@ def hello():
 
         with patch("anthropic.Anthropic") as mock_anthropic:
             mock_client = MagicMock()
-            mock_client.messages.create.side_effect = MockAPIError("API Error")
+            mock_client.messages.stream.side_effect = MockAPIError("API Error")
             mock_anthropic.return_value = mock_client
 
             with patch("gitnudge.ai.anthropic.APIError", MockAPIError):
@@ -1876,7 +1892,7 @@ class TestRebaseFeatures:
         }
 
     def test_continue_rebase_applied_count_on_completion(self):
-        """Applied count at rebase completion = before_total - before_done."""
+        """Stopped at conflict 2/5: continue applies commits 2..5 (4 commits)."""
         from gitnudge.git import RebaseProgress
         config = Config()
         config.api.api_key = "test-key"
@@ -1905,8 +1921,8 @@ class TestRebaseFeatures:
                                     result = nudge.continue_rebase()
 
         assert result.success is True
-        assert result.commits_applied == 3
-        assert "applied 3 more" in result.message
+        assert result.commits_applied == 4
+        assert "applied 4 more" in result.message
 
     def test_continue_rebase_ai_verify_rejects_markers(self):
         config = Config()
@@ -2221,6 +2237,642 @@ class TestV1Regressions:
             out = cf.full_content
         assert out == ""
         assert any("Could not read conflict file" in rec.message for rec in caplog.records)
+
+
+def _git(cwd, *args):
+    return subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True)
+
+
+def _make_conflict_repo(root, base, ours, theirs, fname="f.txt", binary=False):
+    """Create a repo where 'feat' conflicts with 'main' on fname."""
+    root.mkdir(parents=True, exist_ok=True)
+    _git(root, "init", "-q", "-b", "main")
+    _git(root, "config", "user.email", "t@t")
+    _git(root, "config", "user.name", "t")
+    _git(root, "config", "commit.gpgsign", "false")
+    target = root / fname
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    def write(c):
+        if binary:
+            target.write_bytes(c)
+        else:
+            target.write_text(c)
+
+    write(base)
+    _git(root, "add", "-A")
+    _git(root, "commit", "-qm", "init")
+    _git(root, "checkout", "-qb", "feat")
+    write(ours)
+    _git(root, "commit", "-qam", "feat change")
+    _git(root, "checkout", "-q", "main")
+    write(theirs)
+    _git(root, "commit", "-qam", "main change")
+    _git(root, "checkout", "-q", "feat")
+    return root
+
+
+def _stream_client(text, stop_reason="end_turn"):
+    response = MagicMock()
+    response.content = [MagicMock(type="text", text=text)]
+    response.stop_reason = stop_reason
+    client = MagicMock()
+    client.messages.stream.return_value.__enter__.return_value.get_final_message.return_value = (
+        response
+    )
+    return client
+
+
+def _assistant(text="", stop_reason="end_turn", **cfg):
+    from gitnudge.ai import AIAssistant
+    config = Config()
+    config.api.api_key = "test-key"
+    for k, v in cfg.items():
+        setattr(config.behavior, k, v)
+    with patch("anthropic.Anthropic", return_value=_stream_client(text, stop_reason)):
+        return AIAssistant(config)
+
+
+GOOD_RESPONSE = (
+    "EXPLANATION:\nx\n\nRESOLVED_CONTENT:\n```\nmerged\n```\n\n"
+    "CONFIDENCE: high\n\nCHANGES_SUMMARY:\nm"
+)
+
+
+@pytest.fixture
+def isolated_env(tmp_path, monkeypatch):
+    monkeypatch.setenv("GITNUDGE_CONFIG", str(tmp_path / "cfg" / "config.toml"))
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test-0123456789")
+    monkeypatch.delenv("GITNUDGE_MODEL", raising=False)
+    return tmp_path
+
+
+class TestReviewFixes:
+    """Regression tests for the deep-review findings (#1-#18)."""
+
+    def test_01_default_model_is_current(self):
+        from gitnudge.config import DEFAULT_MODEL
+        assert DEFAULT_MODEL == "claude-sonnet-5-5"
+        assert APIConfig().max_tokens == 16000
+
+    def test_02_cli_handles_ai_error(self, isolated_env, monkeypatch):
+        from click.testing import CliRunner
+
+        from gitnudge.ai import AIError
+        from gitnudge.cli import main
+        repo = _make_conflict_repo(isolated_env / "r", "a\n", "b\n", "c\n")
+        _git(repo, "rebase", "main")
+        monkeypatch.chdir(repo)
+        with patch.object(GitNudge, "resolve_conflict", side_effect=AIError("boom")):
+            result = CliRunner().invoke(main, ["--no-color", "resolve", "--auto"])
+        assert result.exit_code == 1
+        assert isinstance(result.exception, SystemExit)
+        assert "boom" in result.output
+
+    def test_03_truncated_or_refused_response_raises(self):
+        from gitnudge.ai import AIError
+        conflict = ConflictFile(Path("x.py"), "a\n", "b\n", "", [])
+        with pytest.raises(AIError, match="cut off"):
+            _assistant("RESOLVED_CONTENT:\n```\npartial", "max_tokens").analyze_conflict(conflict)
+        with pytest.raises(AIError, match="declined"):
+            _assistant("", "refusal").explain_conflict(conflict)
+
+    def test_03_missing_confidence_or_fence_is_low(self):
+        ai = _assistant()
+        no_conf = ai._parse_conflict_response("x", "RESOLVED_CONTENT:\n```\nabc\n```\n")
+        assert no_conf.confidence == "low"
+        unclosed = ai._parse_conflict_response(
+            "x", "RESOLVED_CONTENT:\n```\nabc\nCONFIDENCE: high\n"
+        )
+        assert unclosed.confidence == "low"
+        missing = ai._parse_conflict_response("x", "EXPLANATION:\nnothing\nCONFIDENCE: high")
+        assert missing.confidence == "low"
+        assert missing.resolved_content == ""
+
+    def test_03_cli_auto_skips_low_confidence(self, isolated_env, monkeypatch):
+        from click.testing import CliRunner
+
+        from gitnudge.cli import main
+        repo = _make_conflict_repo(isolated_env / "r", "a\n", "b\n", "c\n")
+        _git(repo, "rebase", "main")
+        before = (repo / "f.txt").read_text()
+        low = ConflictResolution(file_path=str(repo / "f.txt"), resolved_content="x",
+                                 confidence="low")
+        monkeypatch.chdir(repo)
+        with patch.object(GitNudge, "resolve_conflict", return_value=low):
+            result = CliRunner().invoke(main, ["--no-color", "resolve", "--auto"])
+        assert result.exit_code == 0
+        assert "Skipped" in result.output
+        assert (repo / "f.txt").read_text() == before
+
+    def test_04_oversized_file_refused_before_api_call(self, tmp_path):
+        from gitnudge.ai import AIError
+        big = tmp_path / "big.txt"
+        big.write_text("x" * 900 + "\n")
+        ai = _assistant(max_context_lines=10)
+        with patch.object(ai, "_call_api") as call:
+            with pytest.raises(AIError, match="too large"):
+                ai.analyze_conflict(ConflictFile(big, "", "", "", []))
+        call.assert_not_called()
+
+    def test_05_inner_fence_header_lines_and_trailing_newline(self, tmp_path):
+        resolved = "# T\n\n```py\nx=1\n```\n\nwarnings: true\nconfidence: 0.2\nend\n"
+        text = (
+            "EXPLANATION:\nx\n\nRESOLVED_CONTENT:\n```markdown\n" + resolved
+            + "```\n\nCONFIDENCE: high\n\nCHANGES_SUMMARY:\nmerged"
+        )
+        f = tmp_path / "README.md"
+        f.write_text("<<<<<<< a\n=======\n>>>>>>> b\n")
+        res = _assistant(text).analyze_conflict(ConflictFile(f, "o\n", "t\n", "", []))
+        assert res.resolved_content == resolved
+        assert res.confidence == "high"
+        assert res.changes_summary == "merged"
+
+    def test_05_extract_code_block_uses_last_fence(self):
+        from gitnudge.ai import AIAssistant
+        out = AIAssistant._extract_code_block("```md\na\n```py\nb\n```\nc\n```")
+        assert out == "a\n```py\nb\n```\nc"
+
+    def test_06_subdirectory_anchors_to_repo_root(self, tmp_path):
+        repo = _make_conflict_repo(tmp_path / "r", "a\n", "b\n", "c\n", fname="sub/f.txt")
+        _git(repo, "rebase", "main")
+        git = Git(repo / "sub")
+        assert git.repo_path == repo.resolve()
+        assert git.get_conflicted_files() == [repo.resolve() / "sub" / "f.txt"]
+
+    def test_07_binary_conflict_is_flagged_and_refused(self, tmp_path):
+        repo = _make_conflict_repo(
+            tmp_path / "r", b"\x89PNG\x00\x01", b"\x89PNG\x00\x02", b"\x89PNG\x00\x03",
+            fname="img.png", binary=True,
+        )
+        _git(repo, "rebase", "main")
+        config = Config()
+        config.api.api_key = "test-key"
+        nudge = GitNudge(config, repo)
+        details = nudge.git.get_conflict_details(repo / "img.png")
+        assert details.is_binary is True
+        with pytest.raises(GitNudgeError, match="binary"):
+            nudge.resolve_conflict(repo / "img.png")
+
+    def test_07_non_utf8_git_output_does_not_crash(self, tmp_path):
+        repo = _make_conflict_repo(tmp_path / "r", "a\n", "b\n", "c\n")
+        _git(repo, "-c", "i18n.commitEncoding=latin1", "commit", "-q", "--allow-empty",
+             "-m", "caf\udce9")
+        out = Git(repo)._run(["reflog", "-n", "5", "--format=%gs"]).stdout
+        assert "caf" in out
+
+    def test_08_refused_rebase_is_not_success(self, tmp_path):
+        repo = _make_conflict_repo(tmp_path / "r", "a\n", "b\n", "c\n")
+        (repo / "f.txt").write_text("dirty\n")
+        config = Config()
+        config.api.api_key = "test-key"
+        result = GitNudge(config, repo).rebase("main", force=True)
+        assert result.success is False
+        assert "failed" in result.message
+
+    def test_08_auto_continue_failure_is_not_success(self, tmp_path):
+        repo = _make_conflict_repo(tmp_path / "r", "a\n", "b\n", "c\n")
+        config = Config()
+        config.api.api_key = "test-key"
+        nudge = GitNudge(config, repo)
+        resolution = ConflictResolution(file_path=str(repo / "f.txt"),
+                                        resolved_content="m\n", confidence="high")
+        with patch.object(nudge, "resolve_conflict", return_value=resolution):
+            with patch.object(nudge.git, "continue_rebase", return_value=False):
+                result = nudge.rebase("main", auto_resolve=True)
+        assert result.success is False
+        assert result.warnings
+
+    def test_09_config_edit_does_not_persist_env(self, isolated_env, monkeypatch):
+        from click.testing import CliRunner
+
+        from gitnudge.cli import main
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-ENVSECRET-abcdef")
+        monkeypatch.setenv("GITNUDGE_MODEL", "env-model")
+        monkeypatch.setenv("NO_COLOR", "1")
+        result = CliRunner().invoke(main, ["config", "--model", "claude-x"])
+        assert result.exit_code == 0
+        saved = (isolated_env / "cfg" / "config.toml").read_text()
+        assert "ENVSECRET" not in saved
+        assert "env-model" not in saved
+        assert 'model = "claude-x"' in saved
+        assert "color = true" in saved
+
+    def test_10_markup_in_commit_message_and_ai_text(self, isolated_env, monkeypatch):
+        from click.testing import CliRunner
+
+        from gitnudge.cli import main
+        repo = _make_conflict_repo(isolated_env / "r", "a\n", "b\n", "c\n")
+        _git(repo, "commit", "--amend", "-qm", "fix [/] parser [red]")
+        monkeypatch.chdir(repo)
+        result = CliRunner().invoke(main, ["--no-color", "analyze", "main"])
+        assert result.exit_code == 0, result.output
+        assert "fix [/] parser [red]" in result.output
+        _git(repo, "rebase", "main")
+        with patch.object(GitNudge, "explain_conflict", return_value="see [/path] x"):
+            result = CliRunner().invoke(main, ["--no-color", "explain"])
+        assert result.exit_code == 0
+        assert "[/path]" in result.output
+
+    @patch("subprocess.run")
+    def test_11_interactive_rebase_not_captured(self, mock_run):
+        mock_run.return_value = MagicMock(returncode=0)
+        with patch.object(Git, "_verify_repo"):
+            Git().start_rebase("main", interactive=True)
+        assert mock_run.call_args.kwargs["capture_output"] is False
+
+    def test_11_interactive_not_short_circuited_when_up_to_date(self):
+        config = Config()
+        config.api.api_key = "test-key"
+        analysis = RebaseAnalysis("f", "HEAD~2", [], [], "b", is_up_to_date=True)
+        with patch.object(Git, "_verify_repo"):
+            nudge = GitNudge(config)
+        with patch.object(nudge, "preflight", return_value=[]), \
+                patch.object(nudge.git, "analyze_rebase", return_value=analysis), \
+                patch.object(nudge.git, "get_head_sha", return_value="abc123"), \
+                patch.object(nudge, "_save_snapshot"), \
+                patch.object(nudge.git, "start_rebase", return_value=True) as start, \
+                patch.object(nudge.git, "get_rebase_state", return_value=RebaseState.NONE):
+            nudge.rebase("HEAD~2", interactive=True)
+        start.assert_called_once()
+
+    def test_12_branch_behind_target_fast_forwards(self, tmp_path):
+        repo = _make_conflict_repo(tmp_path / "r", "a\n", "a\n", "a2\n")
+        _git(repo, "checkout", "-qb", "behind", "main~1")
+        config = Config()
+        config.api.api_key = "test-key"
+        nudge = GitNudge(config, repo)
+        analysis = nudge.analyze("main")
+        assert analysis.is_up_to_date is False
+        assert analysis.is_fast_forward is True
+        result = nudge.rebase("main")
+        assert result.success is True
+        assert "Fast-forward" in result.message
+        assert _git(repo, "log", "-1", "--format=%s").stdout.strip() == "main change"
+
+    def test_13_unicode_conflicted_path(self, tmp_path):
+        repo = _make_conflict_repo(tmp_path / "r", "a\n", "b\n", "c\n", fname="é.txt")
+        _git(repo, "rebase", "main")
+        assert Git(repo).get_conflicted_files() == [repo.resolve() / "é.txt"]
+
+    def test_14_pipe_in_commit_subject(self, tmp_path):
+        repo = _make_conflict_repo(tmp_path / "r", "a\n", "b\n", "c\n")
+        _git(repo, "commit", "--amend", "-qm", "fix | pipe")
+        commit = Git(repo).get_commits_between("main")[0]
+        assert commit.message == "fix | pipe"
+        assert commit.author == "t"
+
+    def test_15_save_honours_gitnudge_config(self, tmp_path, monkeypatch):
+        target = tmp_path / "custom.toml"
+        monkeypatch.setenv("GITNUDGE_CONFIG", str(target))
+        Config().save()
+        assert target.exists()
+
+    def test_16_invalid_values_raise_clean_errors(self, isolated_env, monkeypatch):
+        from click.testing import CliRunner
+
+        from gitnudge.cli import main
+        monkeypatch.setenv("GITNUDGE_MODEL", "   ")
+        with pytest.raises(ConfigError):
+            Config.load()
+        monkeypatch.delenv("GITNUDGE_MODEL")
+        result = CliRunner().invoke(main, ["config", "--model", "   "])
+        assert result.exit_code == 1
+        assert isinstance(result.exception, SystemExit)
+
+    @pytest.mark.parametrize("payload", ["[1, 2]", '{"head": 123}', '{"head": "zz; x"}', "nope"])
+    def test_17_invalid_snapshot_ignored(self, tmp_path, payload):
+        repo = _make_conflict_repo(tmp_path / "r", "a\n", "b\n", "c\n")
+        (repo / ".git" / GitNudge.SNAPSHOT_NAME).write_text(payload)
+        config = Config()
+        config.api.api_key = "test-key"
+        nudge = GitNudge(config, repo)
+        assert nudge._load_snapshot() is None
+        assert nudge.get_status()["safety_sha"] is None
+        assert nudge.get_recovery_info()["snapshot"] is None
+
+    def test_18_api_call_uses_streaming(self):
+        ai = _assistant("hello")
+        ai.max_tokens = 100_000
+        assert ai._call_api("hi") == "hello"
+        ai.client.messages.stream.assert_called_once()
+        ai.client.messages.create.assert_not_called()
+
+
+@pytest.fixture
+def restore_log_level():
+    import logging
+
+    from gitnudge.logging_utils import set_log_level
+    yield
+    set_log_level(logging.WARNING)
+
+
+class TestReviewFixesLow:
+    """Regression tests for the medium/low review findings."""
+
+    def test_binary_detection_uses_rebase_range(self, tmp_path):
+        repo = _make_conflict_repo(
+            tmp_path / "r", b"\x00base", b"\x00ours", b"\x00theirs",
+            fname="blob.bin", binary=True,
+        )
+        config = Config()
+        config.api.api_key = "test-key"
+        analysis = GitNudge(config, repo).analyze("main")
+        assert analysis.commits_to_rebase
+        assert analysis.potential_conflicts == []
+
+    def test_text_overlap_still_reported(self, tmp_path):
+        repo = _make_conflict_repo(tmp_path / "r", "a\n", "b\n", "c\n")
+        config = Config()
+        config.api.api_key = "test-key"
+        analysis = GitNudge(config, repo).analyze("main")
+        assert [c["file"] for c in analysis.potential_conflicts] == ["f.txt"]
+
+    def test_continue_failure_reports_git_error(self):
+        config = Config()
+        config.api.api_key = "test-key"
+        with patch.object(Git, "_verify_repo"):
+            nudge = GitNudge(config)
+        nudge.git.last_error = "hook rejected commit"
+        with patch.object(nudge.git, "get_rebase_state", return_value=RebaseState.IN_PROGRESS), \
+                patch.object(nudge.git, "get_conflicted_files", return_value=[]), \
+                patch.object(nudge.git, "get_rebase_progress", return_value=None), \
+                patch.object(nudge.git, "continue_rebase", return_value=False):
+            result = nudge.continue_rebase()
+        assert result.success is False
+        assert "hook rejected commit" in result.message
+
+    def test_skip_failure_reports_git_error(self):
+        config = Config()
+        config.api.api_key = "test-key"
+        with patch.object(Git, "_verify_repo"):
+            nudge = GitNudge(config)
+        nudge.git.last_error = "could not skip"
+        with patch.object(nudge.git, "get_rebase_state", return_value=RebaseState.CONFLICT), \
+                patch.object(nudge.git, "get_conflicted_files", return_value=[]), \
+                patch.object(nudge.git, "skip_rebase", return_value=False):
+            result = nudge.skip_rebase()
+        assert result.success is False
+        assert "could not skip" in result.message
+
+    def test_snapshot_kept_after_completion_and_cleared_on_abort(self, tmp_path):
+        repo = _make_conflict_repo(tmp_path / "r", "a\n", "b\n", "c\n")
+        config = Config()
+        config.api.api_key = "test-key"
+        nudge = GitNudge(config, repo)
+        result = nudge.rebase("main")
+        assert result.success is False
+        assert nudge.get_status()["safety_sha"] == result.safety_sha
+
+        (repo / "f.txt").write_text("merged\n")
+        _git(repo, "add", "f.txt")
+        assert nudge.continue_rebase().success is True
+        assert nudge._load_snapshot()["head"] == result.safety_sha
+        assert nudge.get_status()["safety_sha"] is None
+
+        repo2 = _make_conflict_repo(tmp_path / "r2", "a\n", "b\n", "c\n")
+        nudge2 = GitNudge(config, repo2)
+        assert nudge2.rebase("main").success is False
+        assert nudge2._load_snapshot() is not None
+        nudge2.abort_rebase()
+        assert nudge2._load_snapshot() is None
+
+    def test_verbose_and_quiet_set_log_levels(self, restore_log_level):
+        import logging
+
+        from click.testing import CliRunner
+
+        from gitnudge.cli import main
+        cfg = Config()
+        cfg.api.api_key = "test-key"
+        with patch("gitnudge.cli.Config.load", return_value=cfg), \
+                patch.object(Git, "_verify_repo"), \
+                patch.object(Git, "get_current_branch", return_value="main"), \
+                patch.object(Git, "get_rebase_state", return_value=RebaseState.NONE):
+            assert CliRunner().invoke(main, ["--verbose", "status"]).exit_code == 0
+            assert logging.getLogger("gitnudge.core").level == logging.INFO
+            assert CliRunner().invoke(main, ["--quiet", "status"]).exit_code == 0
+            assert logging.getLogger("gitnudge.core").level == logging.ERROR
+
+    def test_quiet_hides_spinner(self, isolated_env, monkeypatch, restore_log_level):
+        from click.testing import CliRunner
+
+        from gitnudge.cli import main
+        repo = _make_conflict_repo(isolated_env / "r", "a\n", "b\n", "c\n")
+        monkeypatch.chdir(repo)
+        normal = CliRunner().invoke(main, ["--no-color", "analyze", "main"])
+        quiet = CliRunner().invoke(main, ["--no-color", "--quiet", "analyze", "main"])
+        assert "Analyzing rebase onto" in normal.output
+        assert "Analyzing rebase onto" not in quiet.output
+        assert quiet.exit_code == 0
+
+    def test_auto_resolve_config_enables_auto(self, isolated_env, monkeypatch):
+        from click.testing import CliRunner
+
+        from gitnudge.cli import main
+        from gitnudge.core import RebaseResult
+        repo = _make_conflict_repo(isolated_env / "r", "a\n", "b\n", "c\n")
+        monkeypatch.chdir(repo)
+        cfg = Config()
+        cfg.api.api_key = "test-key"
+        cfg.behavior.auto_resolve = True
+        done = RebaseResult(success=True, commits_applied=1, conflicts_resolved=0, message="ok")
+        with patch("gitnudge.cli.Config.load", return_value=cfg), \
+                patch.object(GitNudge, "rebase", return_value=done) as rebase:
+            result = CliRunner().invoke(main, ["--no-color", "rebase", "main"])
+        assert result.exit_code == 0
+        assert rebase.call_args.kwargs["auto_resolve"] is True
+
+    def test_project_version_is_0_4_0(self):
+        import sys
+        if sys.version_info >= (3, 11):
+            import tomllib
+        else:
+            import tomli as tomllib
+        root = Path(__file__).resolve().parent.parent
+        data = tomllib.loads((root / "pyproject.toml").read_text())
+        assert data["project"]["version"] == "0.4.0"
+
+
+class TestFinalReviewFixes:
+    """Regression tests for the pre-release review round."""
+
+    def test_retired_model_in_saved_config_is_replaced(self, tmp_path, monkeypatch):
+        from gitnudge.config import DEFAULT_MODEL
+        path = tmp_path / "config.toml"
+        path.write_text('[api]\nmodel = "claude-sonnet-4-20250514"\nmax_tokens = 4096\n')
+        assert Config.load(path).api.model == DEFAULT_MODEL
+        assert Config.load(path, apply_env=False).api.model == DEFAULT_MODEL
+        monkeypatch.setenv("GITNUDGE_MODEL", "claude-opus-4-20250514")
+        assert Config.load(tmp_path / "missing.toml").api.model == DEFAULT_MODEL
+        monkeypatch.setenv("GITNUDGE_MODEL", "claude-custom-model")
+        assert Config.load(path).api.model == "claude-custom-model"
+
+    @staticmethod
+    def _nudge(repo):
+        config = Config()
+        config.api.api_key = "test-key"
+        return GitNudge(config, repo)
+
+    def test_annotated_tag_at_head_is_up_to_date(self, tmp_path):
+        repo = _make_conflict_repo(tmp_path / "r", "a\n", "b\n", "c\n")
+        _git(repo, "tag", "-a", "v1", "-m", "v1")
+        analysis = self._nudge(repo).analyze("v1")
+        assert analysis.is_up_to_date is True
+        assert analysis.is_fast_forward is False
+
+    def test_merge_commits_not_counted(self, tmp_path):
+        repo = _make_conflict_repo(tmp_path / "r", "a\n", "a\n", "a2\n")
+        _git(repo, "checkout", "-qb", "side", "main~1")
+        (repo / "s.txt").write_text("s\n")
+        _git(repo, "add", "s.txt")
+        _git(repo, "commit", "-qm", "side")
+        _git(repo, "checkout", "-q", "feat")
+        _git(repo, "merge", "-q", "--no-edit", "--no-ff", "side")
+        commits = self._nudge(repo).analyze("main").commits_to_rebase
+        assert [c.message for c in commits] == ["side"]
+
+    def test_continue_counts_match_git(self, tmp_path):
+        repo = _make_conflict_repo(tmp_path / "r", "a\n", "b\n", "c\n")
+        for name in ("x", "y"):
+            (repo / name).write_text(name)
+            _git(repo, "add", name)
+            _git(repo, "commit", "-qm", name)
+        nudge = self._nudge(repo)
+        nudge.rebase("main")
+        (repo / "f.txt").write_text("m\n")
+        _git(repo, "add", "f.txt")
+        result = nudge.continue_rebase()
+        assert result.commits_applied == 3
+        assert "applied 3 more" in result.message
+
+    def test_continue_remaining_includes_current(self, tmp_path):
+        repo = _make_conflict_repo(tmp_path / "r", "a\n", "b\n", "c\n")
+        for text in ("b2\n", "b3\n"):
+            (repo / "f.txt").write_text(text)
+            _git(repo, "commit", "-qam", text.strip())
+        nudge = self._nudge(repo)
+        nudge.rebase("main")
+        (repo / "f.txt").write_text("m\n")
+        _git(repo, "add", "f.txt")
+        result = nudge.continue_rebase()
+        assert result.success is False
+        assert "2 commits remaining" in result.message
+
+    def test_progress_applied_count(self):
+        from gitnudge.git import RebaseProgress
+        assert RebaseProgress(2, 5, "", "").applied_count == 1
+        assert RebaseProgress(2, 5, "", "", current_applied=True).applied_count == 2
+
+    def test_symlink_conflict_refused(self, tmp_path):
+        import os
+        repo = tmp_path / "r"
+        repo.mkdir()
+        for args in (("init", "-q", "-b", "main"), ("config", "user.email", "t@t"),
+                     ("config", "user.name", "t")):
+            _git(repo, *args)
+        for name in ("t1", "t2", "t3"):
+            (repo / name).write_text(name + "\n")
+        os.symlink("t1", repo / "link")
+        _git(repo, "add", "-A")
+        _git(repo, "commit", "-qm", "init")
+        _git(repo, "checkout", "-qb", "feat")
+        (repo / "link").unlink()
+        os.symlink("t2", repo / "link")
+        _git(repo, "commit", "-qam", "feat")
+        _git(repo, "checkout", "-q", "main")
+        (repo / "link").unlink()
+        os.symlink("t3", repo / "link")
+        _git(repo, "commit", "-qam", "main")
+        _git(repo, "checkout", "-q", "feat")
+        _git(repo, "rebase", "main")
+
+        nudge = self._nudge(repo)
+        link = nudge.git.repo_path / "link"
+        assert nudge.git.get_conflict_details(link).is_binary is True
+        with pytest.raises(GitNudgeError, match="symlink"):
+            nudge.resolve_conflict(link)
+        with pytest.raises(GitNudgeError, match="symlink"):
+            nudge.apply_resolution(ConflictResolution(file_path=str(link), resolved_content="x"))
+        assert (repo / "t3").read_text() == "t3\n"
+
+    def test_force_refuses_when_rebase_in_progress(self, tmp_path):
+        repo = _make_conflict_repo(tmp_path / "r", "a\n", "b\n", "c\n")
+        nudge = self._nudge(repo)
+        first = nudge.rebase("main")
+        with pytest.raises(GitNudgeError, match="already in progress"):
+            nudge.rebase("main", force=True)
+        assert nudge._load_snapshot()["head"] == first.safety_sha
+
+    def test_auto_loop_stops_cleanly_on_ai_error(self, tmp_path):
+        from gitnudge.ai import AIError
+        repo = _make_conflict_repo(tmp_path / "r", "a\n", "b\n", "c\n")
+        nudge = self._nudge(repo)
+        with patch.object(nudge, "resolve_conflict", side_effect=AIError("too large")):
+            result = nudge.rebase("main", auto_resolve=True)
+        assert result.success is False
+        assert result.safety_sha
+        assert any("too large" in w for w in result.warnings)
+        assert result.conflicts
+
+    def test_four_backtick_fence(self):
+        ai = _assistant()
+        body = "# T\n```py\nx=1\n```\nend"
+        res = ai._parse_conflict_response(
+            "README.md",
+            f"RESOLVED_CONTENT:\n````markdown\n{body}\n````\n\nCONFIDENCE: high\n",
+        )
+        assert res.resolved_content == body
+        assert res.confidence == "high"
+
+    def test_large_side_refused(self, tmp_path):
+        from gitnudge.ai import AIError
+        f = tmp_path / "f.txt"
+        f.write_text("small\n")
+        ai = _assistant(max_context_lines=10)
+        with patch.object(ai, "_call_api") as call:
+            with pytest.raises(AIError, match="too large"):
+                ai.analyze_conflict(ConflictFile(f, "x" * 5000, "y", "", []))
+        call.assert_not_called()
+
+    def test_resolve_all_continues_after_failure(self, isolated_env, monkeypatch):
+        from click.testing import CliRunner
+
+        from gitnudge.ai import AIError
+        from gitnudge.cli import main
+        repo = isolated_env / "r"
+        repo.mkdir()
+        for args in (("init", "-q", "-b", "main"), ("config", "user.email", "t@t"),
+                     ("config", "user.name", "t")):
+            _git(repo, *args)
+        for name in ("a.txt", "b.txt"):
+            (repo / name).write_text("base\n")
+        _git(repo, "add", "-A")
+        _git(repo, "commit", "-qm", "init")
+        _git(repo, "checkout", "-qb", "feat")
+        for name in ("a.txt", "b.txt"):
+            (repo / name).write_text("ours\n")
+        _git(repo, "commit", "-qam", "feat")
+        _git(repo, "checkout", "-q", "main")
+        for name in ("a.txt", "b.txt"):
+            (repo / name).write_text("theirs\n")
+        _git(repo, "commit", "-qam", "main")
+        _git(repo, "checkout", "-q", "feat")
+        _git(repo, "rebase", "main")
+
+        def fake_resolve(path):
+            if path.name == "a.txt":
+                raise AIError("api down")
+            return ConflictResolution(file_path=str(path), resolved_content="merged\n",
+                                      confidence="high")
+
+        monkeypatch.chdir(repo)
+        with patch.object(GitNudge, "resolve_conflict", side_effect=fake_resolve):
+            result = CliRunner().invoke(main, ["--no-color", "resolve", "--all", "--auto"])
+        assert result.exit_code == 1
+        assert "api down" in result.output
+        assert (repo / "b.txt").read_text() == "merged\n"
 
 
 if __name__ == "__main__":

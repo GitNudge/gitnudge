@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import TYPE_CHECKING, Literal
 
 import anthropic
@@ -17,6 +18,11 @@ log = get_logger(__name__)
 
 Confidence = Literal["high", "medium", "low"]
 RiskLevel = Literal["low", "medium", "high"]
+
+_FENCE_CLOSE_TEMPLATE = (
+    r"\n[ \t]*{fence}(?!`)[ \t]*"
+    r"(?:\r?\n(?=\s*(?:CONFIDENCE:|CHANGES_SUMMARY:|EXPLANATION:))|\s*\Z)"
+)
 
 
 class ConflictResolution(BaseModel):
@@ -98,6 +104,19 @@ class AIAssistant:
         """Analyze a conflict and suggest a resolution."""
         max_chars = max(self.config.behavior.max_context_lines, 10) * 80
         full_content = conflict.full_content
+        largest = max(
+            len(full_content), len(conflict.ours_content), len(conflict.theirs_content)
+        )
+        if largest > max_chars:
+            log.warning(
+                "Conflict file %s too large for AI resolution (%d > %d chars)",
+                conflict.path, largest, max_chars,
+            )
+            raise AIError(
+                f"{conflict.path.name} is too large to resolve safely "
+                f"({largest} > {max_chars} chars). Increase "
+                "behavior.max_context_lines or resolve it manually."
+            )
         prompt = f"""Analyze this git merge conflict and suggest a resolution.
 
 ## File: {conflict.path.name}
@@ -145,8 +164,14 @@ CONFIDENCE: [high/medium/low]
 CHANGES_SUMMARY:
 [Summary of changes made]"""
 
-        response = self._call_api(prompt)
-        return self._parse_conflict_response(str(conflict.path), response)
+        response = self._call_api(prompt, allow_truncated=False)
+        resolution = self._parse_conflict_response(str(conflict.path), response)
+
+        reference = conflict.ours_content or conflict.theirs_content or full_content
+        content = resolution.resolved_content
+        if content and reference.endswith("\n") and not content.endswith("\n"):
+            resolution.resolved_content = content + "\n"
+        return resolution
 
     def analyze_rebase(self, analysis: RebaseAnalysis) -> RebaseRecommendation:
         """Analyze a potential rebase and provide recommendations."""
@@ -226,36 +251,55 @@ Keep your explanation concise and actionable."""
 
         return self._call_api(prompt)
 
-    def _call_api(self, prompt: str) -> str:
-        """Make an API call to Claude."""
+    def _call_api(self, prompt: str, allow_truncated: bool = True) -> str:
+        """Make a streaming API call to Claude and return the text output."""
         try:
             log.debug("Calling Claude model=%s max_tokens=%d", self.model, self.max_tokens)
-            response = self.client.messages.create(
+            with self.client.messages.stream(
                 model=self.model,
                 max_tokens=self.max_tokens,
                 system=self.SYSTEM_PROMPT,
                 messages=[{"role": "user", "content": prompt}],
-            )
-
-            parts = [
-                str(getattr(block, "text", ""))
-                for block in (response.content or [])
-                if hasattr(block, "text")
-            ]
-            return "".join(parts)
-
+            ) as stream:
+                response = stream.get_final_message()
         except anthropic.APIError as e:
             log.error("Claude API call failed: %s", redact_secrets(e))
-            raise AIError(f"API call failed: {e}") from e
+            raise AIError(f"API call failed: {redact_secrets(e)}") from e
+
+        stop_reason = getattr(response, "stop_reason", None)
+        if stop_reason == "refusal":
+            log.error("Claude declined the request (stop_reason=refusal)")
+            raise AIError("Claude declined this request (refusal). Resolve it manually.")
+        if stop_reason == "max_tokens":
+            log.warning("Claude response truncated at max_tokens=%d", self.max_tokens)
+            if not allow_truncated:
+                raise AIError(
+                    f"Claude response was cut off at max_tokens={self.max_tokens}; "
+                    "nothing was applied. Increase api.max_tokens and retry."
+                )
+
+        parts = [
+            str(getattr(block, "text", ""))
+            for block in (response.content or [])
+            if hasattr(block, "text")
+        ]
+        return "".join(parts)
 
     def _parse_conflict_response(self, file_path: str, response: str) -> ConflictResolution:
         """Parse the AI response for conflict resolution."""
-        explanation = self._extract_section(response, "EXPLANATION:")
-        resolved = self._extract_code_block(
-            self._extract_section(response, "RESOLVED_CONTENT:")
-        )
-        confidence = self._extract_section(response, "CONFIDENCE:").strip().lower()
-        summary = self._extract_section(response, "CHANGES_SUMMARY:")
+        resolved, complete, span = self._extract_resolved_content(response)
+        rest = response[:span[0]] + "\n" + response[span[1]:] if span else response
+
+        explanation = self._extract_section(rest, "EXPLANATION:")
+        confidence = self._extract_section(rest, "CONFIDENCE:").strip().lower()
+        summary = self._extract_section(rest, "CHANGES_SUMMARY:")
+
+        if not complete:
+            log.warning("Resolved content for %s missing or incomplete", file_path)
+            confidence = "low"
+        elif not confidence:
+            log.warning("No confidence given for %s; treating as low", file_path)
+            confidence = "low"
 
         return ConflictResolution(
             file_path=file_path,
@@ -343,9 +387,47 @@ Keep your explanation concise and actionable."""
 
         return text[body_start:end].strip()
 
+    def _extract_resolved_content(
+        self, response: str
+    ) -> tuple[str, bool, tuple[int, int] | None]:
+        """Extract the RESOLVED_CONTENT code block.
+
+        Returns (content, complete, (start, end) span of header+block in response).
+        """
+        header = "RESOLVED_CONTENT:"
+        start = self._find_header(response.lower(), header.lower())
+        if start == -1:
+            return "", False, None
+
+        open_idx = response.find("```", start + len(header))
+        if open_idx == -1:
+            return "", False, None
+        fence_len = 3
+        while response.startswith("`", open_idx + fence_len):
+            fence_len += 1
+        fence = "`" * fence_len
+        nl = response.find("\n", open_idx)
+        if nl == -1:
+            return "", False, (start, len(response))
+        body_start = nl + 1
+
+        close_re = re.compile(_FENCE_CLOSE_TEMPLATE.format(fence=fence))
+        match = close_re.search(response, nl)
+        if match is None:
+            last = response.rfind("\n" + fence, body_start - 1)
+            if last >= body_start - 1:
+                close_end = response.find("\n", last + 1 + fence_len)
+                close_end = len(response) if close_end == -1 else close_end
+                return response[body_start:max(last, body_start)], False, (start, close_end)
+            return response[body_start:], False, (start, len(response))
+
+        end = match.start()
+        content = response[body_start:end] if end >= body_start else ""
+        return content, True, (start, match.end())
+
     @staticmethod
     def _extract_code_block(text: str) -> str:
-        """Extract code from a markdown code block."""
+        """Extract code from a markdown code block (closing fence is the last one)."""
         start = text.find("```")
         if start == -1:
             return text.strip()
@@ -355,11 +437,12 @@ Keep your explanation concise and actionable."""
             return text.strip()
         body_start = nl + 1
 
-        end = text.find("```", body_start)
-        if end == -1:
-            return text[body_start:].strip()
+        end = text.rfind("```")
+        if end < body_start:
+            return text[body_start:].rstrip("\n")
 
-        return text[body_start:end].strip()
+        body = text[body_start:end]
+        return body[:-1] if body.endswith("\n") else body
 
 
 class AIError(Exception):

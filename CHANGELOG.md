@@ -5,6 +5,107 @@ All notable changes to GitNudge are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-11-19
+
+Safety and correctness release from a full code review. Fixes are covered by
+regression tests (most run against real git repositories).
+
+### Changed
+- **Default model is now `claude-sonnet-5-5`** (was `claude-sonnet-4-20250514`,
+  retired on 2026-06-15, which made every AI command fail out of the box).
+- **Default `api.max_tokens` raised from 4096 to 16000.** Existing config
+  files keep their saved value.
+- **Retired model IDs are replaced automatically.** `config.save()` always
+  wrote the model, so most existing config files pin
+  `claude-sonnet-4-20250514`; known-retired IDs (from the file or
+  `GITNUDGE_MODEL`) now fall back to the default with a warning. Run
+  `gitnudge config --model claude-sonnet-5-5` to update the file.
+- **Claude API calls now stream** (`messages.stream` + `get_final_message`).
+  Large `max_tokens` values no longer fail with the SDK's "streaming is
+  required" `ValueError`.
+- **Recovery snapshot lifetime is consistent:** it is kept after a rebase
+  completes (direct, `continue`, or `skip`) so `gitnudge recover` can undo it,
+  is cleared by `abort`, and is replaced by the next rebase. `gitnudge status`
+  shows the safety SHA only while a rebase is in progress.
+- **`--verbose` / `--quiet` and `ui.verbosity` now take effect:** verbose sets
+  gitnudge logs to INFO (DEBUG if `GITNUDGE_LOG_LEVEL=DEBUG`); quiet hides
+  spinners and shows errors only.
+- **`behavior.auto_resolve = true` now enables `rebase --auto`** (the setting
+  was previously ignored). `gitnudge config` shows it.
+- **`resolve --auto` skips low-confidence resolutions** instead of applying them.
+- **`resolve --all` keeps going when one file fails** (API error, binary file,
+  …), reports the error, and exits with status 1 at the end.
+- **`rebase --force` refuses to run while a rebase is already in progress**, so
+  it can no longer overwrite the recovery snapshot.
+- **Commit counts exclude merge commits**, matching what `git rebase` replays.
+- **"Up to date" now means the target is already in HEAD's history.** A branch
+  that is behind its target is fast-forwarded instead of being reported as up
+  to date. Interactive rebases are never short-circuited (`rebase -i HEAD~5`).
+
+### Fixed
+- **AI output could overwrite files with truncated or wrong content:**
+  - responses cut off at `max_tokens` (or refused) now raise an error and
+    nothing is written;
+  - a missing `CONFIDENCE` or unclosed code fence is treated as `low`
+    (never auto-applied);
+  - files larger than the context limit are refused instead of being silently
+    truncated before being sent to Claude;
+  - a code fence inside the resolved file no longer ends the block early;
+  - header-like lines inside the file (`warnings:`, `confidence:` …) no longer
+    cut the resolved content;
+  - the file's trailing newline is preserved.
+- **API errors crashed with a traceback;** `AIError` is now handled by every
+  command.
+- **Running from a subdirectory broke paths** (`sub/sub/f.txt`); GitNudge now
+  anchors to the repository root and resolves user-supplied paths from the
+  current directory.
+- **Binary or non-UTF-8 conflicts crashed** with `UnicodeDecodeError`; git
+  output is decoded with replacement, and binary conflicts are refused for AI
+  resolve/explain with a manual-resolution hint. Non-UTF-8 reflog entries no
+  longer crash `recover`.
+- **False success reports:** a rebase git refused to start (e.g. `--force` on
+  a dirty tree) or an `--auto` rebase whose `continue` failed is now reported
+  as failed, with git's error message.
+- **`git rebase` / `continue` / `skip` errors were swallowed;** their stderr is
+  now shown in the result message.
+- **`config --model` / `--set-key` wrote environment values to disk**
+  (including `ANTHROPIC_API_KEY`); edits now load the config file only.
+- **`Config.save()` ignored `GITNUDGE_CONFIG`** while `load()` honoured it.
+- **Invalid values (`GITNUDGE_MODEL="  "`, `config --model "  "`) crashed with
+  a pydantic traceback;** they now produce a clean error.
+- **Rich markup in commit messages, file names, git errors or AI output**
+  (e.g. `fix [/] parser`) crashed or hid text; all dynamic text is escaped.
+- **`rebase -i` hid the editor** behind captured output and a spinner; the
+  editor now gets the terminal.
+- **Non-ASCII file names** were returned quoted (`"\303\251.txt"`); paths are
+  read with `-z` and `core.quotePath=false`.
+- **A `|` in a commit subject** broke commit parsing; fields are now split on
+  an unprintable separator.
+- **The snapshot file was not validated;** it is now a pydantic `Snapshot`
+  model (hex `head`), and invalid files are ignored with a warning.
+- **Binary-file filtering in `analyze` never worked** (it compared the working
+  tree to HEAD); it now checks the merge-base..target range.
+- **Symlink conflicts were resolved through the link**, overwriting and staging
+  the link's target file; symlink conflicts now require manual resolution and
+  `apply_resolution` refuses to write through a symlink.
+- **Annotated tags were mis-detected** (tag object SHA compared to commit SHA),
+  so `rebase <tag>` could report "Fast-forwarded" when nothing changed.
+- **`continue` / `skip` commit counts were off by one:** the commit that was
+  stopped on is now counted as applied/remaining (and `edit` stops, where it is
+  already applied, are handled).
+- **`--auto` stopped with an exception on AI errors** (too large, API failure,
+  truncated reply); it now stops cleanly with the conflicts, safety SHA and the
+  reason in the warnings.
+- **Oversized "ours"/"theirs" versions were silently truncated** before being
+  sent to Claude; they are now refused like an oversized working file.
+- **Four-backtick code fences** (used when the file itself contains ```) were
+  not recognised as the closing fence.
+- **Resolved files were written in the locale encoding;** they are now written
+  as UTF-8.
+- **`--no-color` did not apply to error output.**
+- **The resolution preview silently showed only the first 2000 characters;** it
+  now says when the preview is shortened.
+
 ## [0.3.1] - 2026-06-06
 
 Bug-fix release. No API or config changes.

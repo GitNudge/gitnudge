@@ -8,7 +8,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 if sys.version_info >= (3, 11):
     import tomllib
@@ -22,11 +22,23 @@ from gitnudge.logging_utils import get_logger
 log = get_logger(__name__)
 
 
-DEFAULT_MODEL = "claude-sonnet-4-20250514"
+DEFAULT_MODEL = "claude-sonnet-5-5"
+RETIRED_MODELS = frozenset({
+    "claude-sonnet-4-20250514",
+    "claude-opus-4-20250514",
+    "claude-opus-4-1-20250805",
+    "claude-3-haiku-20240307",
+})
 CONFIG_DIR = Path.home() / ".config" / "gitnudge"
 CONFIG_FILE = CONFIG_DIR / "config.toml"
 
 VALID_VERBOSITY = ("quiet", "normal", "verbose")
+
+
+def default_config_path() -> Path:
+    """Return the config path, honouring GITNUDGE_CONFIG."""
+    env_path = os.environ.get("GITNUDGE_CONFIG", "").strip()
+    return Path(env_path).expanduser() if env_path else CONFIG_FILE
 
 
 class APIConfig(BaseModel):
@@ -36,7 +48,7 @@ class APIConfig(BaseModel):
 
     api_key: str = ""
     model: str = DEFAULT_MODEL
-    max_tokens: int = Field(default=4096, ge=1, le=200_000)
+    max_tokens: int = Field(default=16000, ge=1, le=200_000)
 
     @field_validator("api_key")
     @classmethod
@@ -112,23 +124,37 @@ class Config(BaseModel):
     ui: UIConfig = Field(default_factory=UIConfig)
 
     @classmethod
-    def load(cls, config_path: Path | None = None) -> Config:
-        """Load configuration from file and environment variables.
+    def load(cls, config_path: Path | None = None, apply_env: bool = True) -> Config:
+        """Load configuration from file and (optionally) environment variables.
 
         Priority (highest to lowest):
-        1. Environment variables
+        1. Environment variables (when apply_env is True)
         2. Config file
         3. Default values
         """
         if config_path is None:
-            config_path = Path(os.environ.get("GITNUDGE_CONFIG", str(CONFIG_FILE)))
+            config_path = default_config_path()
 
         if config_path.exists():
             config = cls._load_from_file(config_path)
         else:
             config = cls()
 
-        return cls._apply_env_vars(config)
+        if apply_env:
+            config = cls._apply_env_vars(config)
+        return cls._replace_retired_model(config)
+
+    @staticmethod
+    def _replace_retired_model(config: Config) -> Config:
+        """Swap a retired model ID for the current default."""
+        if config.api.model in RETIRED_MODELS:
+            log.warning(
+                "Model %s is retired; using %s. Update it with "
+                "'gitnudge config --model %s'.",
+                config.api.model, DEFAULT_MODEL, DEFAULT_MODEL,
+            )
+            config.api.model = DEFAULT_MODEL
+        return config
 
     @classmethod
     def _load_from_file(cls, path: Path) -> Config:
@@ -155,13 +181,19 @@ class Config(BaseModel):
     @classmethod
     def _apply_env_vars(cls, config: Config) -> Config:
         """Apply environment variable overrides."""
-        env_key = os.environ.get("ANTHROPIC_API_KEY")
-        if env_key:
-            config.api.api_key = env_key
+        try:
+            env_key = os.environ.get("ANTHROPIC_API_KEY")
+            if env_key:
+                config.api.api_key = env_key
 
-        env_model = os.environ.get("GITNUDGE_MODEL")
-        if env_model:
-            config.api.model = env_model
+            env_model = os.environ.get("GITNUDGE_MODEL")
+            if env_model:
+                config.api.model = env_model
+        except ValidationError as e:
+            log.error("Invalid environment override: %s", e.errors()[0].get("msg", e))
+            raise ConfigError(
+                f"Invalid environment variable value: {e.errors()[0].get('msg', e)}"
+            ) from e
 
         if os.environ.get("GITNUDGE_NO_COLOR") or os.environ.get("NO_COLOR"):
             config.ui.color = False
@@ -171,13 +203,14 @@ class Config(BaseModel):
     def save(self, config_path: Path | None = None) -> None:
         """Save configuration to file atomically with restricted permissions."""
         if config_path is None:
-            config_path = CONFIG_FILE
+            config_path = default_config_path()
 
         config_path.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            config_path.parent.chmod(0o700)
-        except OSError:
-            pass
+        if config_path.parent == CONFIG_DIR:
+            try:
+                config_path.parent.chmod(0o700)
+            except OSError:
+                pass
 
         data = {
             "api": self.api.to_dict(),

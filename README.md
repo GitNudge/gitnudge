@@ -4,7 +4,7 @@
 
 [![Lint](https://github.com/GitNudge/gitnudge/actions/workflows/lint.yml/badge.svg)](https://github.com/GitNudge/gitnudge/actions/workflows/lint.yml)
 [![Test](https://github.com/GitNudge/gitnudge/actions/workflows/test.yml/badge.svg)](https://github.com/GitNudge/gitnudge/actions/workflows/test.yml)
-[![Version](https://img.shields.io/badge/version-0.3.0-blue.svg)](https://github.com/GitNudge/gitnudge/releases)
+[![Version](https://img.shields.io/badge/version-0.4.0-blue.svg)](https://github.com/GitNudge/gitnudge/releases)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://www.python.org/downloads/)
 
@@ -32,7 +32,7 @@ GitNudge is an open-source CLI tool that helps you perform git rebases with the 
 pip install git+https://github.com/GitNudge/gitnudge.git
 
 # Install a specific tag/release
-pip install git+https://github.com/GitNudge/gitnudge.git@v0.3.0
+pip install git+https://github.com/GitNudge/gitnudge.git@v0.4.0
 ```
 
 ### From source
@@ -104,7 +104,7 @@ Get AI help resolving current conflicts during a rebase.
 gitnudge resolve                  # Resolve the first conflict
 gitnudge resolve src/utils.py     # Resolve a specific file
 gitnudge resolve --all            # Walk through all conflicts
-gitnudge resolve --auto           # Auto-apply suggestions without confirmation
+gitnudge resolve --auto           # Auto-apply high/medium-confidence suggestions (low ones are skipped)
 ```
 
 ### `gitnudge explain [file]`
@@ -135,7 +135,7 @@ gitnudge skip
 
 ### `gitnudge abort`
 
-Abort the current rebase operation and clear the recovery snapshot.
+Abort the current rebase operation and clear the recovery snapshot. After a rebase completes, the snapshot is kept so `gitnudge recover` can still undo it; the next rebase replaces it.
 
 ```bash
 gitnudge abort
@@ -151,7 +151,7 @@ gitnudge recover
 
 ### `gitnudge status`
 
-Show the current branch, rebase state, conflicted files, live progress (`commit X/Y`), and the safety snapshot SHA.
+Show the current branch, rebase state, conflicted files, live progress (`commit X/Y`), and the safety snapshot SHA while a rebase is in progress.
 
 ```bash
 gitnudge status
@@ -164,7 +164,7 @@ Manage GitNudge configuration.
 ```bash
 gitnudge config --show            # Show current config
 gitnudge config --set-key         # Set API key interactively
-gitnudge config --model claude-sonnet-4-20250514  # Set model
+gitnudge config --model claude-sonnet-5-5  # Set model
 gitnudge config --reset           # Reset to defaults
 ```
 
@@ -185,11 +185,11 @@ GitNudge can be configured via:
 # Your Anthropic API key (or use ANTHROPIC_API_KEY env var)
 api_key = "sk-ant-..."
 
-# Model to use (default: claude-sonnet-4-20250514)
-model = "claude-sonnet-4-20250514"
+# Model to use (default: claude-sonnet-5-5)
+model = "claude-sonnet-5-5"
 
 # Max tokens per Claude response (1 - 200000)
-max_tokens = 4096
+max_tokens = 16000
 
 [behavior]
 # Automatically stage resolved files
@@ -201,14 +201,14 @@ show_previews = true
 # Maximum context lines sent to AI (10 - 10000)
 max_context_lines = 500
 
-# Auto-apply high/medium-confidence resolutions during rebase
+# Auto-apply high/medium-confidence resolutions during rebase (same as `rebase --auto`)
 auto_resolve = false
 
 [ui]
 # Enable colored output
 color = true
 
-# Verbosity level: quiet, normal, verbose
+# Verbosity level: quiet (no spinners; logs show errors only), normal, verbose (INFO logs)
 verbosity = "normal"
 ```
 

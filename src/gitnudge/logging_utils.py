@@ -46,6 +46,17 @@ def redact_secrets(value: Any) -> str:
     return _API_KEY_PATTERN.sub("sk-***REDACTED***", text)
 
 
+def set_log_level(level: int) -> None:
+    """Set the level of every configured gitnudge logger and its handlers."""
+    for name, logger in list(logging.root.manager.loggerDict.items()):
+        if not isinstance(logger, logging.Logger):
+            continue
+        if name == "gitnudge" or name.startswith("gitnudge."):
+            logger.setLevel(level)
+            for handler in logger.handlers:
+                handler.setLevel(level)
+
+
 def get_logger(name: str = "gitnudge") -> logging.Logger:
     """Return a configured logger with secret redaction."""
     logger = logging.getLogger(name)

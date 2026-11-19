@@ -167,7 +167,7 @@ gitnudge/
 │   ├── ai.py               # Claude integration + pydantic AI response models
 │   └── logging_utils.py    # Structured logging with API-key redaction
 ├── tests/
-│   └── test_gitnudge.py    # 134 unit tests
+│   └── test_gitnudge.py    # unit + real-git regression tests
 ├── .github/workflows/
 │   ├── lint.yml            # ruff + mypy on push & PR
 │   ├── test.yml            # pytest on Python 3.9–3.12, ubuntu + macos
